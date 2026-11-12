@@ -257,9 +257,15 @@ function viewMake() {
 
       ${state.mode === 'suit' ? `
       <div class="field">
-        <label>正装</label>
-        <div class="opts">
-          ${SUITS.map((s) => `<button class="opt" data-act="suit" data-id="${s.id}" aria-pressed="${s.id === state.suit}">${esc(s.name)}</button>`).join('')}
+        <label>正装 <span class="hint" style="font-weight:400">点图选择</span></label>
+        <div class="suits">
+          ${SUITS.map((s) => `
+            <button class="suit" data-act="suit" data-id="${s.id}" aria-pressed="${s.id === state.suit}" title="${esc(s.desc)}">
+              <span class="ph">
+                ${s.preview ? `<img src="${s.preview}" alt="${esc(s.short)}" loading="lazy" />` : ''}
+              </span>
+              <span class="nm">${esc(s.short || s.name)}</span>
+            </button>`).join('')}
         </div>
       </div>` : ''}
 
