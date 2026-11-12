@@ -1,0 +1,27 @@
+{
+  "app": {
+    "name": "标准证件照红蓝白",
+    "title": "证件照在家一键拍摄",
+    "subtitle": "换正装 · 换底色 · 排版冲印",
+    "version": "1.0.0"
+  },
+  "features": {
+    "login": false,
+    "vip": false,
+    "ads": false,
+    "payment": false,
+    "print": false
+  },
+  "wechat": {
+    "_comment": "上线到微信 H5 / 公众号时填这里；小程序侧则填 appId + 商户号。现在留空，功能未启用。",
+    "appId": "",
+    "mchId": "",
+    "jsapiTicketEndpoint": "/api/wechat/jssdk",
+    "payEndpoint": "/api/wechat/pay"
+  },
+  "gen": {
+    "model": "gpt-image-2",
+    "size": "1024x1536",
+    "outputDir": "outputs"
+  }
+}

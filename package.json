@@ -1,0 +1,15 @@
+{
+  "name": "idphoto-h5",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "证件照 H5：换正装 / 换底色 / 排版冲印。换装走本机 chatgpt2api 号池生图，无登录、无会员、无广告。",
+  "scripts": {
+    "start": "node server.mjs",
+    "test:gen": "node test_generate.mjs",
+    "test:e2e": "node tools/cdp_test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

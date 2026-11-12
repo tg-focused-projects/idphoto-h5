@@ -1,0 +1,12 @@
+# 生成产物 / 日志 / 本地依赖
+outputs/
+*.log
+node_modules/
+.DS_Store
+Thumbs.db
+
+# 本地实验文件
+_preview-*.png
+_zoom-*.png
+test-photo.*
+*.crdownload
