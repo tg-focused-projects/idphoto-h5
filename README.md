@@ -1,6 +1,6 @@
 # 证件照 H5（复刻《标准证件照红蓝白》，换正装走 chatgpt2api 生图）
 
-原小程序的逆向结论见上级目录 `证件照小程序_逆向与换正装复刻.md`。
+原小程序的逆向结论（包格式、加密算法、接口面、落地页清单）另存文档，不在本仓库内。
 这一份是可直接跑的 **H5 版本**：纯静态前端 + 一个 Node 本地服务，换正装用本机号池的 `gpt-image-2` 做参考图编辑，
 构图裁剪 / 底色 / 300dpi / 冲印排版全在浏览器本地完成。
 
@@ -157,13 +157,14 @@ Authorization: Bearer <~/.dsh/chatgpt2api-native/admin-key>
 | 导出 二寸 | `413×579`，dpi `300,300`，52KB | — |
 | 导出 6 寸排版 | `1800×1200`，dpi `300,300`，15 张 1 寸带裁切线 | — |
 
-合计消耗 **2 次号池额度**（剩余 186）。对比图：`../out/h5-test-compare.jpg`。
+合计消耗 **2 次号池额度**（剩余 186）。
+
+界面截图：`docs/screenshot-home.png`、`docs/screenshot-make.png`、`docs/screenshot-desktop.png`。
+真实人脸的处理效果图不入库（涉及肖像，跑一次本地就有了）。
 
 结论：一轮就能出可用证件照；胡渣/发丝这类细节建议走第二轮精修，且**第二轮必须拿第一轮结果当参考图**，
 否则模型会连脸一起重画。第二轮会稍微增加磨皮感，如果报名系统要求"原始肤质"，就到第一轮为止。
 
-界面截图：`../out/h5-home.png`、`../out/h5-make-result.png`（生成结果页）、`../out/h5-mobile-home.png`、`../out/h5-mobile.png`、`../out/h5-mobile-mine.png`；
-出图样例：`../out/h5-result-suit-438edb.png`、`../out/h5-browser-result.png`、`../out/h5-export-1inch.jpg`（可直接投报名系统）。
 
 ---
 
