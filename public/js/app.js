@@ -46,7 +46,10 @@ function apiHeaders(extra = {}) {
 }
 
 async function loadConfig() {
-  try { state.cfg = await (await fetch('/api/config')).json(); } catch { state.cfg = {}; }
+  try {
+    state.cfg = await (await fetch('/api/config')).json();
+    if (state.cfg.public === true) state.publicMode = true;
+  } catch { state.cfg = {}; }
   refreshStatus();
 }
 async function refreshStatus() {

@@ -359,6 +359,11 @@ async function runJob(id) {
 
 /* -------------------------------------------------------------- 路由 */
 async function handleApi(req, res, url) {
+  // /api/config 是给前端渲染用的非敏感配置（不含 key），公网模式下也放行
+  if (req.method === 'GET' && url === '/api/config') {
+    return json(res, 200, { ok: true, ...CONFIG, public: PUBLIC_MODE }, corsHeaders(req));
+  }
+
   const isGen = req.method === 'POST' && (url === '/api/generate' || url === '/v1/jobs' || url === '/api/jobs');
   const g = guard(req, isGen ? 'gen' : 'poll');
   if (g) return json(res, g[0], g[1], corsHeaders(req));
@@ -373,10 +378,6 @@ async function handleApi(req, res, url) {
       limits: { perMinute: PER_MINUTE, perDay: PER_DAY },
       features: CONFIG.features || {},
     }, corsHeaders(req));
-  }
-
-  if (req.method === 'GET' && url === '/api/config') {
-    return json(res, 200, { ok: true, ...CONFIG }, corsHeaders(req));
   }
 
   // 同步生成（H5 用）
