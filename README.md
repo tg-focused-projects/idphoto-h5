@@ -47,8 +47,11 @@
 
 ```
 h5/
-├─ server.mjs              本地服务：静态站 + /api/generate 代理（admin key 只在服务端）
-├─ config.json             appId / mchId 空位 + 功能开关（login/vip/payment/ads/print 全 false）
+├─ server.mjs              本地服务 + 公网 API：静态站 / 同步 /api/generate / 异步 /v1/jobs
+├─ router.mjs              公网分流：/idphoto/* → 8088，其余 → 38650（一个 ngrok 端点服务两个服务）
+├─ config.json             appId / mchId 空位 + 功能开关 + 限流配置（key 不在这里）
+├─ api-keys.json           ★ 公网 API 密钥，gitignore，不入库
+├─ lib/jpeg.mjs            PNG→JPEG 压缩（ngrok 带宽只有 ~30KB/s，必须压）
 ├─ public/
 │  ├─ index.html           壳 + 底部 tabbar
 │  ├─ css/app.css
@@ -56,8 +59,11 @@ h5/
 │     ├─ specs.js          15 个规格 / 6 种底色 / 5 套正装 / 提示词构造
 │     ├─ compose.js        构图裁剪（头高 62%、头顶留白 9%）+ JPEG 300dpi + 冲印排版
 │     └─ app.js            hash 路由 + 四个视图 + 生成/导出流程
+├─ scripts/start.ps1       一键起 8088 + 8090 + ngrok，打印公网 base 和 key 前缀
+├─ scripts/stop.ps1        全停（含 38650 的公网入口）
 ├─ test_generate.mjs       不走浏览器，直接打 /api/generate 验证后端链路
 ├─ tools/
+│  ├─ public_api_client.mjs  公网 API 客户端：提交任务→轮询→取图
 │  ├─ cdp_test.mjs         无头 Chrome(CDP) 跑完整链路：选图→生成→截图→导出→校验
 │  ├─ probe_layout.mjs     量视口/grid 轨道，排查横向溢出
 │  └─ shot_mobile.mjs      390×844@2x 手机视口截图
@@ -168,7 +174,112 @@ Authorization: Bearer <~/.dsh/chatgpt2api-native/admin-key>
 
 ---
 
-## 五、接自己的 AppID / 商户号全在 `config.json`，当前一律留空、功能开关全关：
+## 五、公网 API（异步任务式）
+
+本机这套生图后端现在有一个公网入口，形状照本机 ComfyUI 的
+`POST /prompt` → `GET /history/{id}` → `GET /view?filename=` 来的：**提交任务 → 轮询 → 取图**。
+单张 40~90s，公网长连接容易被代理/移动网络掐断，异步比同步稳。
+
+```
+公网 base：https://propeller-flattery-feminism.ngrok-free.dev/idphoto
+鉴权     ：Authorization: Bearer <api-keys.json 里的 key>
+```
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/health` | 后端是否在线 + 号池剩余额度 + 限流档位 |
+| POST | `/v1/jobs` | 提交生成任务，`202 {job_id, poll_url}` |
+| GET | `/v1/jobs/{id}` | `pending` / `running` / `succeeded` / `failed` |
+| GET | `/files/{name}` | 取图（`result.url` 是 PNG，`result.jpeg_url` 是压缩版） |
+| POST | `/api/generate` | 同步版（H5 用，本机同源不校验 key） |
+
+提交体：
+
+```json
+{
+  "image": "data:image/jpeg;base64,...",   // 也支持 http(s) 图片地址
+  "prompt": "同一张照片的证件照处理；服装换成深色西装外套…",
+  "size": "1024x1536"
+}
+```
+
+查询结果：
+
+```json
+{
+  "ok": true, "job_id": "job_xxx", "status": "succeeded", "elapsed_ms": 45000,
+  "result": {
+    "url": "https://.../idphoto/files/xxx.png", "bytes": 2056955,
+    "jpeg_url": "https://.../idphoto/files/xxx.jpg", "jpeg_bytes": 191491
+  }
+}
+```
+
+### 现成客户端
+
+```bash
+node tools/public_api_client.mjs <照片> https://propeller-flattery-feminism.ngrok-free.dev/idphoto <key>
+```
+
+实测（1080×1920 自拍压到 720×1280，蓝底西装）：
+
+| 阶段 | 耗时 |
+|---|---|
+| 提交 → `running` | ~25s |
+| `running` → `succeeded` | 共 **45s** |
+| 下载 JPEG（187KB） | 6.4s |
+| 下载 PNG（2.0MB） | 52s |
+
+**所以公网一定优先用 `jpeg_url`**：ngrok 免费通道实测只有 ~30KB/s，2MB 的 PNG 要 52s，200KB 的 JPEG 6s 就完了。
+服务端出图后会自动压一张 q88 的 JPEG（`lib/jpeg.mjs`，用本机 Pillow，193ms），两个地址一起返回。
+
+### 限流
+
+| 档 | 默认 | 配置项 |
+|---|---|---|
+| 生成 | 6 次/分钟，80 次/天 | `config.json → api.rateLimit.perMinute / perDay` |
+| 轮询/取图 | 120 次/分钟 | `config.json → api.rateLimit.pollPerMinute` |
+
+轮询单独一档：客户端每 3s 查一次，20 次/分钟，跟生成抢额度会把自己限死（这个坑实测踩过）。
+
+### 为什么是 `/idphoto` 前缀 + 一个 router
+
+ngrok 免费账号的 dev 域名是**账号级唯一**的。再起 `ngrok http 8088` 会撞：
+
+```
+ERR_NGROK_334 The endpoint 'https://propeller-flattery-feminism.ngrok-free.dev' is already online
+```
+
+所以没有新开隧道，而是把已有端点接到 `router.mjs`（:8090）上按路径分流：
+
+```
+ngrok → router:8090
+          ├─ /idphoto/*  → 127.0.0.1:8088   （本项目）
+          └─ 其它        → 127.0.0.1:38650  （原有 chatgpt2api，路径完全不变）
+```
+
+原来 `https://propeller-flattery-feminism.ngrok-free.dev/v1/models`、`/health` 这些照旧可用，已验证。
+
+### 起停
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\start.ps1   # 起 8088 + 8090 + ngrok
+powershell -ExecutionPolicy Bypass -File scripts\stop.ps1    # 全停（含 38650 的公网入口）
+```
+
+### 密钥
+
+- 只存在 `api-keys.json`（**已 gitignore**），或环境变量 `IDPHOTO_API_KEYS`（逗号分隔多个）。
+- 换 key：改文件 → 重启 `server.mjs`。
+- 仓库里不含任何 key；`config.json` 只有限流和 CORS 配置。
+
+---
+
+## 六、接自己的 AppID / 商户号
+
+全在 `config.json`，当前一律留空、功能开关全关：
 
 ```json
 {
@@ -192,7 +303,7 @@ Authorization: Bearer <~/.dsh/chatgpt2api-native/admin-key>
 
 ---
 
-## 六、已知限制
+## 七、已知限制
 
 1. **单张一次生成**：一张照片一次调用，改底色/换装都要重新出图（1 次额度）。想省额度可以走「只裁剪原图导出」。
 2. **模型偏好长构图**：`1024x1536` 是竖图里最接近证件照比例的；再方的尺寸它会自己补背景。

@@ -3,7 +3,7 @@
     "name": "标准证件照红蓝白",
     "title": "证件照在家一键拍摄",
     "subtitle": "换正装 · 换底色 · 排版冲印",
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "features": {
     "login": false,
@@ -23,5 +23,14 @@
     "model": "gpt-image-2",
     "size": "1024x1536",
     "outputDir": "outputs"
+  },
+  "api": {
+    "_comment": "公网 API 配置。key 不写在这里，放 api-keys.json（已 gitignore）或环境变量 IDPHOTO_API_KEYS。",
+    "publicBase": "",
+    "rateLimit": {
+      "perMinute": 6,
+      "perDay": 80
+    },
+    "cors": ["*"]
   }
 }

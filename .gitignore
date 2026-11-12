@@ -5,8 +5,14 @@ node_modules/
 .DS_Store
 Thumbs.db
 
+# 密钥与隧道配置（绝不入库）
+api-keys.json
+ngrok*.yml
+ngrok*.log
+
 # 本地实验文件
 _preview-*.png
 _zoom-*.png
 test-photo.*
 *.crdownload
+out/
