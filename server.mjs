@@ -32,9 +32,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { toJpeg } from './lib/jpeg.mjs';
+import {
+  MODES, SUITS, BGS, SIZES, DEFAULTS,
+  normalizeParams, buildPrompt, buildRefinePrompt, describeParams,
+} from './lib/prompt.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const LIB_DIR = path.join(__dirname, 'lib');
 const OUT_DIR = path.join(__dirname, 'outputs');
 const PORT = Number(process.env.PORT || 8088);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -51,6 +56,7 @@ const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -299,8 +305,15 @@ function jobView(id, req) {
     elapsed_ms: j.finishedAt ? j.finishedAt - j.startedAt : (j.startedAt ? Date.now() - j.startedAt : 0),
     model: j.model,
     size: j.size,
+    passes: j.passes || 1,
     poll_url: `${base}/v1/jobs/${id}`,
   };
+  // 结构化入参的任务，把「后端最终拼出来的 prompt」也回给调用方，方便排查效果问题
+  if (j.params) {
+    view.params = j.params;
+    view.params_summary = j.paramsSummary || null;
+    view.prompt = j.prompt;
+  }
   if (j.status === 'succeeded') {
     view.result = {
       url: `${base}/files/${j.result.name}`,
@@ -311,6 +324,10 @@ function jobView(id, req) {
     if (j.result.jpeg) {
       view.result.jpeg_url = `${base}/files/${j.result.jpeg.name}`;
       view.result.jpeg_bytes = j.result.jpeg.bytes;
+    }
+    if (j.result.firstPass) {
+      view.result.first_pass_url = `${base}/files/${j.result.firstPass.name}`;
+      view.result.refine_prompt = j.refinePrompt || null;
     }
   }
   if (j.status === 'failed') view.error = { message: j.error, detail: j.errorDetail || null, hint: j.errorHint || null };
@@ -342,7 +359,23 @@ async function runJob(id) {
   j.status = 'running';
   j.startedAt = Date.now();
   try {
-    const out = await callImageApi({ image: j.image, prompt: j.prompt, size: j.size, model: j.model });
+    let out = await callImageApi({ image: j.image, prompt: j.prompt, size: j.size, model: j.model });
+
+    // passes=2：拿第一轮结果当参考图再精修一轮（多消耗 1 次额度）
+    if (j.passes === 2 && j.refinePrompt) {
+      const first = out;
+      const pngPath = path.join(OUT_DIR, first.name);
+      const buf = await fsp.readFile(pngPath);
+      const refined = await callImageApi({
+        image: { mime: 'image/png', buffer: buf },
+        prompt: j.refinePrompt,
+        size: j.size,
+        model: j.model,
+      });
+      refined.firstPass = first;
+      out = refined;
+    }
+
     j.status = 'succeeded';
     j.result = out;
     j.finishedAt = Date.now();
@@ -364,9 +397,27 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: true, ...CONFIG, public: PUBLIC_MODE }, corsHeaders(req));
   }
 
-  const isGen = req.method === 'POST' && (url === '/api/generate' || url === '/v1/jobs' || url === '/api/jobs');
+  const isGen = req.method === 'POST' && (url === '/api/generate' || url === '/api/idphoto'
+    || url === '/v1/jobs' || url === '/api/jobs' || url === '/v1/idphoto');
   const g = guard(req, isGen ? 'gen' : 'poll');
   if (g) return json(res, g[0], g[1], corsHeaders(req));
+
+  // 可选参数表：前端拿它渲染下拉框，不用把枚举写死在客户端
+  if (req.method === 'GET' && (url === '/v1/options' || url === '/api/options')) {
+    return json(res, 200, {
+      ok: true,
+      modes: MODES,
+      suits: SUITS,
+      bgs: BGS,
+      sizes: SIZES,
+      defaults: DEFAULTS,
+      notes: {
+        passes: '1=一轮出图；2=出图后自动用结果再精修一轮（多消耗 1 次额度）',
+        size: '出图尺寸，构图裁剪在客户端按规格像素做',
+        extra: '自由补充要求，最长 300 字',
+      },
+    }, corsHeaders(req));
+  }
 
   // 健康 / 状态
   if (req.method === 'GET' && (url === '/api/health' || url === '/api/status')) {
@@ -410,7 +461,104 @@ async function handleApi(req, res, url) {
     }
   }
 
-  // 异步任务：提交
+  // ── 结构化参数：同步版（H5 用）─────────────────────────────
+  //    POST /api/idphoto  { image, mode, suit, bg, cleanShave, tidyHair, extra, size, passes }
+  //    后端按参数拼 prompt，前端不再传提示词。
+  if (req.method === 'POST' && url === '/api/idphoto') {
+    let body;
+    try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) {
+      return json(res, 400, { ok: false, error: '请求体不是合法 JSON：' + e.message }, corsHeaders(req));
+    }
+    const norm = normalizeParams(body);
+    if (!norm.ok) return json(res, 400, { ok: false, error: norm.error }, corsHeaders(req));
+    let image;
+    try { image = parseImage(body.image); } catch (e) {
+      return json(res, 400, { ok: false, error: e.message }, corsHeaders(req));
+    }
+
+    const params = norm.params;
+    const prompt = params.refineOnly ? buildRefinePrompt(params) : buildPrompt(params);
+    const t0 = Date.now();
+    try {
+      let out = await callImageApi({ image, prompt, size: params.size, model: body.model });
+      let firstPass = null;
+      let refinePrompt = null;
+      if (!params.refineOnly && params.passes === 2) {
+        firstPass = out;
+        refinePrompt = buildRefinePrompt(params);
+        const buf = await fsp.readFile(path.join(OUT_DIR, firstPass.name));
+        out = await callImageApi({
+          image: { mime: 'image/png', buffer: buf },
+          prompt: refinePrompt,
+          size: params.size,
+          model: body.model,
+        });
+      }
+      return json(res, 200, {
+        ok: true,
+        params,
+        params_summary: describeParams(params),
+        prompt,
+        ...(refinePrompt ? { refine_prompt: refinePrompt } : {}),
+        url: '/files/' + out.name,
+        jpeg_url: out.jpeg ? '/files/' + out.jpeg.name : null,
+        bytes: out.bytes,
+        jpeg_bytes: out.jpeg?.bytes ?? null,
+        ...(firstPass ? { first_pass_url: '/files/' + firstPass.name } : {}),
+        elapsed_ms: Date.now() - t0,
+        model: body.model || 'gpt-image-2',
+      }, corsHeaders(req));
+    } catch (e) {
+      const code = /超时|timeout/i.test(String(e.message)) ? 504 : 502;
+      return json(res, code, { ok: false, error: e.message, detail: e.detail, hint: e.hint, prompt }, corsHeaders(req));
+    }
+  }
+
+  // ── 结构化参数：异步版（公网 API 用）───────────────────────
+  //    POST /v1/idphoto  → 202 { job_id, poll_url, prompt, params }
+  if (req.method === 'POST' && url === '/v1/idphoto') {
+    let body;
+    try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) {
+      return json(res, 400, { ok: false, error: '请求体不是合法 JSON：' + e.message }, corsHeaders(req));
+    }
+    const norm = normalizeParams(body);
+    if (!norm.ok) return json(res, 400, { ok: false, error: norm.error }, corsHeaders(req));
+    let image;
+    try { image = parseImage(body.image); } catch (e) {
+      return json(res, 400, { ok: false, error: e.message }, corsHeaders(req));
+    }
+    if (image.buffer && image.buffer.length > 12 * 1024 * 1024) {
+      return json(res, 413, { ok: false, error: '参考图超过 12MB' }, corsHeaders(req));
+    }
+
+    const params = norm.params;
+    const prompt = params.refineOnly ? buildRefinePrompt(params) : buildPrompt(params);
+    const id = newJobId();
+    const job = {
+      status: 'pending', createdAt: Date.now(), startedAt: 0, finishedAt: 0,
+      image, prompt, params, paramsSummary: describeParams(params),
+      passes: params.refineOnly ? 1 : params.passes,
+      refinePrompt: (!params.refineOnly && params.passes === 2) ? buildRefinePrompt(params) : null,
+      size: params.size,
+      model: body.model || CONFIG.gen?.model || 'gpt-image-2',
+    };
+    jobs.set(id, job);
+    setImmediate(() => runJob(id));
+
+    return json(res, 202, {
+      ok: true,
+      job_id: id,
+      status: 'pending',
+      poll_url: `${publicBase(req)}/v1/jobs/${id}`,
+      retry_after_ms: 3000,
+      params,
+      params_summary: job.paramsSummary,
+      prompt,
+      ...(job.refinePrompt ? { refine_prompt: job.refinePrompt } : {}),
+    }, corsHeaders(req));
+  }
+
+  // 异步任务：提交（原始 prompt 版，给需要完全自定义提示词的调用方）
   if (req.method === 'POST' && (url === '/v1/jobs' || url === '/api/jobs')) {
     let body;
     try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) {
@@ -451,7 +599,18 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: true, ...view }, corsHeaders(req));
   }
 
-  return json(res, 404, { ok: false, error: 'not found', endpoints: ['GET /api/health', 'POST /api/generate', 'POST /v1/jobs', 'GET /v1/jobs/{id}', 'GET /files/{name}'] }, corsHeaders(req));
+  return json(res, 404, {
+    ok: false,
+    error: 'not found',
+    endpoints: [
+      'GET  /api/health',
+      'GET  /v1/options',
+      'POST /v1/idphoto      ← 结构化参数（推荐）：{ image, mode, suit, bg, cleanShave, tidyHair, extra, size, passes }',
+      'POST /v1/jobs         ← 原始 prompt（自定义提示词用）',
+      'GET  /v1/jobs/{id}',
+      'GET  /files/{name}',
+    ],
+  }, corsHeaders(req));
 }
 
 async function serveStatic(req, res, url) {
@@ -463,6 +622,10 @@ async function serveStatic(req, res, url) {
   if (p.startsWith('/files/') || p.startsWith('/outputs/')) {
     file = path.join(OUT_DIR, path.basename(p));
     if (!path.resolve(file).startsWith(path.resolve(OUT_DIR))) return json(res, 403, { ok: false, error: 'forbidden' });
+  } else if (p.startsWith('/lib/')) {
+    // 前后端共用的模块（lib/prompt.mjs 等），浏览器直接 import
+    file = path.join(LIB_DIR, path.basename(p));
+    if (!path.resolve(file).startsWith(path.resolve(LIB_DIR))) return json(res, 403, { ok: false, error: 'forbidden' });
   } else {
     file = path.join(PUBLIC_DIR, p);
     if (!path.resolve(file).startsWith(path.resolve(PUBLIC_DIR))) return json(res, 403, { ok: false, error: 'forbidden' });
@@ -498,6 +661,8 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
     const isApi = url === '/api/health' || url === '/api/status' || url === '/api/config'
+      || url === '/api/options' || url === '/v1/options'
+      || url === '/api/idphoto' || url === '/v1/idphoto'
       || url.startsWith('/api/generate') || url.startsWith('/v1/jobs') || url.startsWith('/api/jobs');
     if (isApi) return await handleApi(req, res, url);
     if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { ok: false, error: 'method not allowed' });
@@ -511,6 +676,6 @@ server.listen(PORT, HOST, () => {
   const s = backendStatus();
   console.log(`[idphoto] listening http://${HOST}:${PORT}`);
   console.log(`[idphoto] 生图后端 ${C2A_BASE}  key:${c2aKey() ? 'ok' : 'missing'}`);
-  console.log(`[idphoto] 公网调用需 X-Idphoto-Public:1 + Bearer key；已加载 key 数: ${KEYS.length}`);
+  console.log(`[idphoto] 公网调用需 Bearer key（PUBLIC_MODE=${PUBLIC_MODE}）；已加载 key 数: ${KEYS.length}`);
   console.log(`[idphoto] 限流 ${PER_MINUTE}/min, ${PER_DAY}/day`);
 });

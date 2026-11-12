@@ -3,13 +3,13 @@
  * ============================================================
  *   node tools/public_api_client.mjs <照片> <公网baseURL> <apiKey> [prompt]
  *
- * 走的是「提交任务 → 轮询 → 取图」这套异步形状（照 ComfyUI 的 /prompt → /history → /view）：
+ * 默认走**参数化接口**（推荐）：前端只传选项，提示词由后端拼。
+ *   POST {base}/v1/idphoto  { image, params:{ mode, suit, bg, cleanShave, tidyHair, size, passes } }
+ *   GET  {base}/v1/jobs/{id}
+ *   GET  {base}/files/{name}
  *
- *   POST {base}/v1/jobs           → 202 {job_id, poll_url}
- *   GET  {base}/v1/jobs/{id}      → {status: pending|running|succeeded|failed, result:{url}}
- *   GET  {base}/files/{name}      → 图片字节
- *
- * 为什么不用同步接口：单张 40~90s，公网长连接（尤其经代理/移动网络）容易被中间设备掐掉。
+ * 传了第 4 个参数（prompt）则改走原始提示词接口 POST {base}/v1/jobs。
+ * 为什么异步：单张 40~90s，公网长连接容易被中间设备掐掉。
  */
 
 import fs from 'node:fs';
@@ -22,30 +22,26 @@ if (!photoArg || !baseArg || !keyArg) {
 }
 
 const base = baseArg.replace(/\/+$/, '');
-const prompt = promptArg || [
-  '同一张照片的证件照处理',
-  '服装换成深色西装外套，内搭白色衬衫并系深色领带',
-  '背景替换为纯蓝色，无渐变、无阴影、无纹理',
-  '正面免冠，双肩平齐，面部居中，头顶留白自然，光线均匀',
-  '五官比例与本人一致，保留真实皮肤质感，不做美颜、不瘦脸、不放大眼睛',
-].join('；');
-
-const mime = /\.png$/i.test(photoArg) ? 'image/png' : 'image/jpeg';
-const dataUrl = `data:${mime};base64,` + fs.readFileSync(photoArg).toString('base64');
+const dataUrl = 'data:image/jpeg;base64,' + fs.readFileSync(photoArg).toString('base64');
 console.log(`照片 ${path.basename(photoArg)}  payload ${(dataUrl.length / 1024 / 1024).toFixed(2)}MB`);
 
 const auth = { Authorization: `Bearer ${keyArg}`, 'Content-Type': 'application/json' };
-
-// 1) 提交
 const t0 = Date.now();
-const submit = await fetch(`${base}/v1/jobs`, {
-  method: 'POST',
-  headers: auth,
-  body: JSON.stringify({ image: dataUrl, prompt, size: '1024x1536' }),
+
+// 1) 提交：有 prompt 走原始接口，没有就走参数化接口
+const useRaw = !!promptArg;
+const submitBody = useRaw
+  ? { image: dataUrl, prompt: promptArg, size: '1024x1536' }
+  : { image: dataUrl, params: { mode: 'suit', suit: 'black-suit', bg: '438edb', cleanShave: true, tidyHair: false, size: '1024x1536', passes: 1 } };
+
+const submit = await fetch(`${base}${useRaw ? '/v1/jobs' : '/v1/idphoto'}`, {
+  method: 'POST', headers: auth, body: JSON.stringify(submitBody),
 });
 const job = await submit.json();
-console.log('submit', submit.status, JSON.stringify(job).slice(0, 300));
-if (!job.ok) process.exit(1);
+console.log(`submit ${submit.status}  ${useRaw ? '(原始 prompt)' : '(参数化)'}`);
+if (job.params_summary) console.log('  params:', job.params_summary);
+if (job.prompt) console.log('  prompt:', job.prompt);
+if (!job.ok) { console.error(JSON.stringify(job)); process.exit(1); }
 
 // 2) 轮询
 let view = null;

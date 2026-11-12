@@ -1,4 +1,4 @@
-import { SPECS, CATEGORIES, BGS, SUITS, buildPrompt, buildRefinePrompt, findSpec } from './specs.js';
+import { SPECS, CATEGORIES, BGS, SUITS, findSpec, describeParams } from './specs.js';
 import {
   loadImg, fileToDataURL, downscaleForUpload, cropToSpec,
   canvasToJpeg, download, buildSheet, analyzeFraming,
@@ -76,14 +76,26 @@ function paintStatus() {
   el.innerHTML = `<span class="dot"></span>号池 <b>${b.quota ?? '?'}</b> 次`;
 }
 
-async function generate(imageDataUrl, prompt) {
-  const r = await fetch('/api/generate', {
+/** 当前界面选项 → 结构化参数（提示词由后端拼，前端不再碰） */
+function currentParams(extra = {}) {
+  return {
+    mode: state.mode,
+    suit: state.suit,
+    bg: state.bg,
+    cleanShave: state.cleanShave,
+    tidyHair: state.tidyHair,
+    size: state.cfg?.gen?.size || '1024x1536',
+    ...extra,
+  };
+}
+
+async function requestIdphoto(imageDataUrl, params) {
+  const r = await fetch('/api/idphoto', {
     method: 'POST',
     headers: apiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       image: imageDataUrl,
-      prompt,
-      size: state.cfg?.gen?.size || '1024x1536',
+      params,
       model: state.cfg?.gen?.model || 'gpt-image-2',
     }),
   });
@@ -473,11 +485,6 @@ function wire(path) {
 /* ------------------------------------------------------------------ 生成 */
 async function runGenerate() {
   if (!state.photoImg || state.busy) return;
-  const spec = findSpec(state.specId);
-  const prompt = buildPrompt({
-    mode: state.mode, suit: state.suit, bgHex: state.bg,
-    cleanShave: state.cleanShave, tidyHair: state.tidyHair,
-  });
 
   state.busy = true;
   state.error = '';
@@ -486,10 +493,12 @@ async function runGenerate() {
 
   try {
     const small = downscaleForUpload(state.photoImg, 1280);
-    const out = await generate(small, prompt);
+    // 只传参数，prompt 由后端拼（lib/prompt.mjs，前后端同一份模板）
+    const out = await requestIdphoto(small, currentParams({ passes: state.passes || 1 }));
     state.resultUrl = out.url;
     state.resultImg = await loadImg(out.url);
     state.lastMs = out.elapsed_ms;
+    state.lastSummary = out.params_summary || describeParams(out.params || {});
     state.busy = false;
     render();
     toast(`生成完成 · ${(out.elapsed_ms / 1000).toFixed(1)}s`, 2600);
@@ -518,13 +527,9 @@ async function urlToDataUrl(url) {
   });
 }
 
-/** 第二轮：拿上一版结果当参考图，只做局部精修 */
+/** 第二轮：拿上一版结果当参考图，只做局部精修（同样是参数化，refineOnly 让后端切到精修模板） */
 async function runRefine() {
   if (!state.resultUrl || state.busy) return;
-  const prompt = buildRefinePrompt({
-    cleanShave: state.cleanShave,
-    tidyHair: state.tidyHair,
-  });
 
   state.busy = true;
   state.error = '';
@@ -535,9 +540,10 @@ async function runRefine() {
     const src = state.resultImg
       ? downscaleForUpload(state.resultImg, 1280)
       : await urlToDataUrl(state.resultUrl);
-    const out = await generate(src, prompt);
+    const out = await requestIdphoto(src, currentParams({ refineOnly: true }));
     state.resultUrl = out.url;
     state.resultImg = await loadImg(out.url);
+    state.lastSummary = out.params_summary || describeParams(out.params || {});
     state.busy = false;
     render();
     toast(`精修完成 · ${(out.elapsed_ms / 1000).toFixed(1)}s`, 2600);
