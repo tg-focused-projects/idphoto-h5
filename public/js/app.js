@@ -56,7 +56,7 @@ async function refreshStatus() {
   try {
     const j = await (await fetch('/api/status', { headers: apiHeaders() })).json();
     state.status = j.backend || null;
-    state.publicMode = j.public === true;
+    if (j.public === true) state.publicMode = true;
     state.authError = j.ok === false ? (j.error || '') : '';
   } catch { state.status = null; }
   paintStatus();
