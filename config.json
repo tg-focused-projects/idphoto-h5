@@ -22,14 +22,20 @@
   "gen": {
     "model": "gpt-image-2",
     "size": "1024x1536",
-    "outputDir": "outputs"
+    "outputDir": "outputs",
+    "jpeg": {
+      "enabled": true,
+      "quality": 88
+    }
   },
   "api": {
-    "_comment": "公网 API 配置。key 不写在这里，放 api-keys.json（已 gitignore）或环境变量 IDPHOTO_API_KEYS。",
+    "_comment": "公网 API 配置。key 不写在这里，放 api-keys.json（已 gitignore）或环境变量 IDPHOTO_API_KEYS。public=true 时所有 /api/* /v1/* 都强制 Bearer（公网部署用；本地同源开发保持 false）。",
+    "public": false,
     "publicBase": "",
     "rateLimit": {
       "perMinute": 6,
-      "perDay": 80
+      "perDay": 80,
+      "pollPerMinute": 120
     },
     "cors": ["*"]
   }

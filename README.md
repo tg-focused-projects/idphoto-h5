@@ -8,8 +8,9 @@
 |---|---|
 | ![首页](docs/screenshot-home.png) | ![制作页](docs/screenshot-make.png) |
 
-- 打开地址：**http://127.0.0.1:8088**
-- 起服务：`node server.mjs`（或 `npm start`）
+- 本地打开：**http://127.0.0.1:8000**
+- 公网 API：**http://110.40.183.197:8000**（frp 隧道，需要 Bearer key）
+- 起服务：`powershell -ExecutionPolicy Bypass -File scripts\start.ps1`（或 `node server.mjs` 只跑本地）
 - 生图前提：DSH 在跑（`127.0.0.1:38650` 有 python 进程）+ 代理开着（`127.0.0.1:7890`）
 
 ---
@@ -48,10 +49,10 @@
 ```
 h5/
 ├─ server.mjs              本地服务 + 公网 API：静态站 / 同步 /api/generate / 异步 /v1/jobs
-├─ router.mjs              公网分流：/idphoto/* → 8088，其余 → 38650（一个 ngrok 端点服务两个服务）
+├─ router.mjs              可选：一个公网端口分流到两个本地服务（现在 8000 独占，用不到）
 ├─ config.json             appId / mchId 空位 + 功能开关 + 限流配置（key 不在这里）
 ├─ api-keys.json           ★ 公网 API 密钥，gitignore，不入库
-├─ lib/jpeg.mjs            PNG→JPEG 压缩（ngrok 带宽只有 ~30KB/s，必须压）
+├─ lib/jpeg.mjs            PNG→JPEG 压缩（省流量：2MB → 190KB）
 ├─ public/
 │  ├─ index.html           壳 + 底部 tabbar
 │  ├─ css/app.css
@@ -59,8 +60,11 @@ h5/
 │     ├─ specs.js          15 个规格 / 6 种底色 / 5 套正装 / 提示词构造
 │     ├─ compose.js        构图裁剪（头高 62%、头顶留白 9%）+ JPEG 300dpi + 冲印排版
 │     └─ app.js            hash 路由 + 四个视图 + 生成/导出流程
-├─ scripts/start.ps1       一键起 8088 + 8090 + ngrok，打印公网 base 和 key 前缀
-├─ scripts/stop.ps1        全停（含 38650 的公网入口）
+├─ frpc.toml               frp 隧道：本地 8000 → frps 110.40.183.197:8000
+├─ .env.example            FRP_AUTH_TOKEN 模板（复制成 .env）
+├─ scripts/start.ps1       一键起 8000（公网模式）+ frpc，打印公网 base
+├─ scripts/start-tunnel.ps1  单独起 frpc（token 从环境变量/.env 注入）
+├─ scripts/stop.ps1        停 8000 + frpc
 ├─ test_generate.mjs       不走浏览器，直接打 /api/generate 验证后端链路
 ├─ tools/
 │  ├─ public_api_client.mjs  公网 API 客户端：提交任务→轮询→取图
@@ -174,109 +178,130 @@ Authorization: Bearer <~/.dsh/chatgpt2api-native/admin-key>
 
 ---
 
-## 五、公网 API（异步任务式）
+## 五、公网 API（frp 隧道 + 异步任务式）
 
-本机这套生图后端现在有一个公网入口，形状照本机 ComfyUI 的
-`POST /prompt` → `GET /history/{id}` → `GET /view?filename=` 来的：**提交任务 → 轮询 → 取图**。
-单张 40~90s，公网长连接容易被代理/移动网络掐断，异步比同步稳。
+本机这套生图后端挂在**自己的 frps** 上，做法跟原来 ComfyUI/Qwen 生图接口一模一样：
+rpc 把本地端口用 tcp 代理到 110.40.183.197，公网直接访问。
 
-```
-公网 base：https://propeller-flattery-feminism.ngrok-free.dev/idphoto
+`
+公网 base：http://110.40.183.197:8000
 鉴权     ：Authorization: Bearer <api-keys.json 里的 key>
-```
+本地 H5  ：http://127.0.0.1:8000
+`
+
+接口形状照 ComfyUI 的 POST /prompt → GET /history/{id} → GET /view?filename=：
+**提交任务 → 轮询 → 取图**。单张 40~90s，公网长连接容易被中间设备掐断，异步比同步稳。
 
 ### 接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/health` | 后端是否在线 + 号池剩余额度 + 限流档位 |
-| POST | `/v1/jobs` | 提交生成任务，`202 {job_id, poll_url}` |
-| GET | `/v1/jobs/{id}` | `pending` / `running` / `succeeded` / `failed` |
-| GET | `/files/{name}` | 取图（`result.url` 是 PNG，`result.jpeg_url` 是压缩版） |
-| POST | `/api/generate` | 同步版（H5 用，本机同源不校验 key） |
+| GET | /api/health | 后端在线 + 号池额度 + 限流档位（需要 key） |
+| POST | /v1/jobs | 提交生成任务，202 {job_id, poll_url} |
+| GET | /v1/jobs/{id} | pending / unning / succeeded / ailed |
+| GET | /files/{name} | 取图（esult.url PNG / esult.jpeg_url 压缩版，**不需要 key**） |
+| POST | /api/generate | 同步版（H5 用；公网模式下同样需要 key） |
 
 提交体：
 
-```json
+`json
 {
   "image": "data:image/jpeg;base64,...",   // 也支持 http(s) 图片地址
   "prompt": "同一张照片的证件照处理；服装换成深色西装外套…",
   "size": "1024x1536"
 }
-```
+`
 
 查询结果：
 
-```json
+`json
 {
-  "ok": true, "job_id": "job_xxx", "status": "succeeded", "elapsed_ms": 45000,
+  "ok": true, "job_id": "job_xxx", "status": "succeeded", "elapsed_ms": 55000,
   "result": {
-    "url": "https://.../idphoto/files/xxx.png", "bytes": 2056955,
-    "jpeg_url": "https://.../idphoto/files/xxx.jpg", "jpeg_bytes": 191491
+    "url": "http://110.40.183.197:8000/files/xxx.png", "bytes": 2056955,
+    "jpeg_url": "http://110.40.183.197:8000/files/xxx.jpg", "jpeg_bytes": 191491
   }
 }
-```
+`
 
 ### 现成客户端
 
-```bash
-node tools/public_api_client.mjs <照片> https://propeller-flattery-feminism.ngrok-free.dev/idphoto <key>
-```
+`ash
+node tools/public_api_client.mjs <照片> http://110.40.183.197:8000 <key>
+`
 
 实测（1080×1920 自拍压到 720×1280，蓝底西装）：
 
 | 阶段 | 耗时 |
 |---|---|
-| 提交 → `running` | ~25s |
-| `running` → `succeeded` | 共 **45s** |
-| 下载 JPEG（187KB） | 6.4s |
-| 下载 PNG（2.0MB） | 52s |
+| 提交 → unning | ~20s |
+| unning → succeeded | 共 **55s** |
+| 取 JPEG（188KB） | < 1s |
+| 取 PNG（2.0MB） | **3.0s**（frp，695KB/s） |
 
-**所以公网一定优先用 `jpeg_url`**：ngrok 免费通道实测只有 ~30KB/s，2MB 的 PNG 要 52s，200KB 的 JPEG 6s 就完了。
-服务端出图后会自动压一张 q88 的 JPEG（`lib/jpeg.mjs`，用本机 Pillow，193ms），两个地址一起返回。
+**带宽对比**：同一张 2MB PNG，ngrok 免费通道 30KB/s 要 52s，frp 到自己服务器 695KB/s 只要 3s。
+所以优先 jpeg_url 依然是对的（省流量），但 frp 下 PNG 也能接受。
+服务端出图后会自动压一张 q88 的 JPEG（lib/jpeg.mjs，用本机 Pillow，193ms），两个地址一起返回。
+
+### 为什么是 8000
+
+本机 frps（110.40.183.197:7000）实测**只放行 remotePort 8000**，试过 8001/8080/8091/9000 全部 port not allowed。
+原来 8000 是 Qwen 生图 API 的，现在那套不用了，8000 直接给本项目：
+
+`	oml
+# frpc.toml
+serverAddr = "110.40.183.197"
+serverPort = 7000
+auth.token = "{{ .Envs.FRP_AUTH_TOKEN }}"
+transport.tls.enable = true
+
+[[proxies]]
+name = "idphoto-api"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8000
+remotePort = 8000
+`
+
+token 不写死：scripts/start-tunnel.ps1 按「环境变量 → h5\.env → D:\Qwen-Image-Edit-2511\.env」顺序找 FRP_AUTH_TOKEN。
+
+> 附：outer.mjs 是给「一个公网端口要同时服务两个本地服务」用的（ngrok 免费账号 dev 域名唯一、
+> 或者 frps 只给一个端口时）。现在 8000 独占，不需要它；要用就
+> ROUTER_PORT=8095 FALLBACK_PORT=38650 node router.mjs。
 
 ### 限流
 
 | 档 | 默认 | 配置项 |
 |---|---|---|
-| 生成 | 6 次/分钟，80 次/天 | `config.json → api.rateLimit.perMinute / perDay` |
-| 轮询/取图 | 120 次/分钟 | `config.json → api.rateLimit.pollPerMinute` |
+| 生成 | 6 次/分钟，80 次/天 | config.json → api.rateLimit.perMinute / perDay |
+| 轮询/取图 | 120 次/分钟 | config.json → api.rateLimit.pollPerMinute |
 
-轮询单独一档：客户端每 3s 查一次，20 次/分钟，跟生成抢额度会把自己限死（这个坑实测踩过）。
+轮询单独一档：客户端每 3s 查一次，跟生成抢额度会把自己限死（这个坑实测踩过）。
 
-### 为什么是 `/idphoto` 前缀 + 一个 router
+### 鉴权模式
 
-ngrok 免费账号的 dev 域名是**账号级唯一**的。再起 `ngrok http 8088` 会撞：
+| 模式 | 触发 | 行为 |
+|---|---|---|
+| 本机同源 | 默认 | /api/*、/v1/* 免 key（本地开发方便） |
+| 公网 | IDPHOTO_PUBLIC=1 或 config.json → api.public=true | **所有** /api/*、/v1/* 必须 Bearer；/files/* 与静态页仍开放 |
 
-```
-ERR_NGROK_334 The endpoint 'https://propeller-flattery-feminism.ngrok-free.dev' is already online
-```
-
-所以没有新开隧道，而是把已有端点接到 `router.mjs`（:8090）上按路径分流：
-
-```
-ngrok → router:8090
-          ├─ /idphoto/*  → 127.0.0.1:8088   （本项目）
-          └─ 其它        → 127.0.0.1:38650  （原有 chatgpt2api，路径完全不变）
-```
-
-原来 `https://propeller-flattery-feminism.ngrok-free.dev/v1/models`、`/health` 这些照旧可用，已验证。
+公网部署时 H5 的「我的」页有一个 **API Key** 输入框，填一次存在浏览器 localStorage，
+之后页面自己带 Authorization 头，公网也能直接用。
 
 ### 起停
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start.ps1   # 起 8088 + 8090 + ngrok
-powershell -ExecutionPolicy Bypass -File scripts\stop.ps1    # 全停（含 38650 的公网入口）
-```
+`powershell
+powershell -ExecutionPolicy Bypass -File scripts\start.ps1   # 起 8000（公网模式）+ frpc
+powershell -ExecutionPolicy Bypass -File scripts\stop.ps1    # 停 8000 + frpc
+`
 
 ### 密钥
 
-- 只存在 `api-keys.json`（**已 gitignore**），或环境变量 `IDPHOTO_API_KEYS`（逗号分隔多个）。
-- 换 key：改文件 → 重启 `server.mjs`。
-- 仓库里不含任何 key；`config.json` 只有限流和 CORS 配置。
+- 只存在 pi-keys.json（**已 gitignore**），或环境变量 IDPHOTO_API_KEYS（逗号分隔多个）。
+- 换 key：改文件 → 重启 server.mjs。
+- 仓库里不含任何 key；config.json 只有限流和 CORS 配置。
 
 ---
-
 ## 六、接自己的 AppID / 商户号
 
 全在 `config.json`，当前一律留空、功能开关全关：
@@ -311,7 +336,7 @@ powershell -ExecutionPolicy Bypass -File scripts\stop.ps1    # 全停（含 3865
   正式对外开放前建议改成签名 URL（HMAC + 过期时间），或者取图也套 Bearer。
 - outputs/ 不会自动清理：一张 2MB，跑多了会堆。生产上定时清或直接落对象存储（OSS/COS/S3）。
 - 任务表在单实例内存里：/v1/jobs 的记录重启即丢（结果文件还在）。要多实例得换 Redis。
-- ngrok 免费通道带宽 ~30KB/s 且域名是账号级的：并发一高就排队，正式用要换付费隧道或自有域名反代。
+- 带宽：frp 到自己服务器实测 ~700KB/s，够用；如果换成 ngrok 免费通道会掉到 ~30KB/s（那才必须靠 JPEG 兜）。
 
 **产品相关**
 

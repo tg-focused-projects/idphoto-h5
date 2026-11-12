@@ -68,6 +68,10 @@ function loadConfig() {
 }
 const CONFIG = loadConfig();
 const API_CFG = CONFIG.api || {};
+
+// 公网模式：整站对外（frp / 公网反代直接连本进程），所有 /api/*、/v1/* 都要 key。
+// 本地同源开发默认不开，H5 直接调不需要密钥。
+const PUBLIC_MODE = String(process.env.IDPHOTO_PUBLIC ?? (API_CFG.public ? '1' : '0')) === '1';
 const PER_MINUTE = Number(API_CFG.rateLimit?.perMinute ?? 6);
 const PER_DAY = Number(API_CFG.rateLimit?.perDay ?? 80);
 const POLL_PER_MINUTE = Number(API_CFG.rateLimit?.pollPerMinute ?? 120);
@@ -148,7 +152,8 @@ function safeEqual(a, b) {
  *        'poll' 查任务/取图（轮询很密，单独一档，别和生成抢额度）
  */
 function guard(req, kind = 'gen') {
-  if (!isPublicCall(req)) return null;               // 本机同源调用
+  // 本机同源（没走公网入口）且不是公网模式 → 放行
+  if (!PUBLIC_MODE && !isPublicCall(req)) return null;
   if (!KEYS.length) return [503, { ok: false, error: '服务端未配置 API key（api-keys.json / IDPHOTO_API_KEYS）' }];
   const k = clientKey(req);
   if (!k) return [401, { ok: false, error: '缺少 Authorization: Bearer <key>' }];
@@ -362,6 +367,7 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && (url === '/api/health' || url === '/api/status')) {
     return json(res, 200, {
       ok: true,
+      public: PUBLIC_MODE,
       backend: await backendStatus(),
       jobs: { total: jobs.size, running: [...jobs.values()].filter((j) => j.status === 'running').length },
       limits: { perMinute: PER_MINUTE, perDay: PER_DAY },

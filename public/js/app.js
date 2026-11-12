@@ -38,14 +38,23 @@ function toast(msg, ms = 2200) {
 }
 
 /* ------------------------------------------------------------------ API */
+const KEY_STORE = 'idphoto_api_key';
+const apiKey = () => localStorage.getItem(KEY_STORE) || '';
+function apiHeaders(extra = {}) {
+  const k = apiKey();
+  return { ...extra, ...(k ? { Authorization: 'Bearer ' + k } : {}) };
+}
+
 async function loadConfig() {
   try { state.cfg = await (await fetch('/api/config')).json(); } catch { state.cfg = {}; }
   refreshStatus();
 }
 async function refreshStatus() {
   try {
-    const j = await (await fetch('/api/status')).json();
+    const j = await (await fetch('/api/status', { headers: apiHeaders() })).json();
     state.status = j.backend || null;
+    state.publicMode = j.public === true;
+    state.authError = j.ok === false ? (j.error || '') : '';
   } catch { state.status = null; }
   paintStatus();
   // 状态是异步到的：制作/我的 两页依赖它，到货后补一次重绘
@@ -55,7 +64,11 @@ function paintStatus() {
   const el = $('#statusChip');
   if (!el) return;
   const b = state.status;
-  if (!b) { el.innerHTML = '<span class="dot off"></span>后端未知'; return; }
+  if (!b) {
+    const needKey = /Authorization|API key/i.test(state.authError || '');
+    el.innerHTML = `<span class="dot off"></span>${needKey ? '需要 API key' : '后端未知'}`;
+    return;
+  }
   if (!b.reachable) { el.innerHTML = '<span class="dot off"></span>生图后端离线'; return; }
   el.innerHTML = `<span class="dot"></span>号池 <b>${b.quota ?? '?'}</b> 次`;
 }
@@ -63,7 +76,7 @@ function paintStatus() {
 async function generate(imageDataUrl, prompt) {
   const r = await fetch('/api/generate', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       image: imageDataUrl,
       prompt,
@@ -298,6 +311,18 @@ function viewMine() {
     ${row('微信商户号', wx.mchId || '未填写（保留位）', false)}
     ${row('生图模型', state.cfg?.gen?.model || 'gpt-image-2', false)}
     ${row('生图后端', state.status?.reachable ? `在线 · 剩余 ${state.status.quota} 次` : '离线', false)}
+    ${row('运行模式', state.publicMode ? '公网（所有接口需要 key）' : '本机同源（免 key）', false)}
+  </div>
+
+  <div class="section-title">API Key <small>公网访问时必填，只存在本机浏览器</small></div>
+  <div class="list">
+    <div class="row" style="gap:8px">
+      <input id="apiKeyInput" type="password" placeholder="sk-idp-..." value="${esc(apiKey())}"
+             style="flex:1;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px;outline:none" />
+      <button class="opt" data-act="save-key">保存</button>
+      <button class="opt" data-act="clear-key">清除</button>
+    </div>
+    ${state.authError ? `<div class="row"><span class="k">当前状态</span><span class="v" style="color:var(--danger)">${esc(state.authError)}</span></div>` : ''}
   </div>
 
   <div class="section-title">说明</div>
@@ -370,6 +395,23 @@ function wire(path) {
       setTimeout(() => toast('选好照片后点「排版 6 寸相纸」，本地直接导出 1800×1200', 3200), 500);
       return;
     }
+    if (act === 'save-key') {
+      const v = ($('#apiKeyInput')?.value || '').trim();
+      if (!v) return toast('先填 key');
+      localStorage.setItem(KEY_STORE, v);
+      toast('已保存，刷新状态…');
+      refreshStatus();
+      render();
+      return;
+    }
+    if (act === 'clear-key') {
+      localStorage.removeItem(KEY_STORE);
+      toast('已清除 key');
+      refreshStatus();
+      render();
+      return;
+    }
+
     if (act === 'show-orig') { const s = $('#stage'); if (s?.querySelector('img')) s.querySelector('img').src = state.photoUrl; return; }
     if (act === 'show-result') { const s = $('#stage'); if (s?.querySelector('img')) s.querySelector('img').src = state.resultUrl; return; }
 

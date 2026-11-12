@@ -1,15 +1,19 @@
 /**
- * 公网路由：一个 ngrok 端点同时服务两个本地服务
+ * 公网路由：一个公网端口同时服务两个本地服务
  * =====================================================
  *   /idphoto/*  → 127.0.0.1:8088   （本项目：生图 API + H5）
- *   其它        → 127.0.0.1:38650  （本机 chatgpt2api 后端，保持原路径不变）
+ *   其它        → 127.0.0.1:FALLBACK_PORT（默认 38650 chatgpt2api）
  *
- * 为什么要这一层：
- *   ngrok 免费账号的 dev 域名是**账号级唯一**的（本机是 propeller-flattery-feminism.ngrok-free.dev），
- *   第二个 `ngrok http 8088` 会撞 ERR_NGROK_334（同一 endpoint 已在线）。
- *   所以不新开隧道，而是把已有端点接到这个 router 上，用路径分流。
+ * 两个场景都靠它：
+ *   1) ngrok：免费账号 dev 域名唯一，一个端点只能指一个本地端口 → 8090 分流到 8088 / 38650
+ *   2) frp  ：frps 只放行 remotePort 8000，而这个口是 Qwen 生图 API 的
+ *             → 8095 分流到 8088 / 8000，公网 8000 上两个服务共存
  *
- * 起：node router.mjs        （监听 127.0.0.1:8090）
+ * 环境变量：
+ *   ROUTER_PORT    监听端口（默认 8090）
+ *   IDPHOTO_PORT   本项目端口（默认 8088）
+ *   FALLBACK_PORT  其它流量转发到哪（默认 38650；走 frp 时设 8000）
+ *   ROUTER_PREFIX  路径前缀（默认 /idphoto）
  */
 
 import http from 'node:http';
@@ -17,8 +21,8 @@ import net from 'node:net';
 
 const PORT = Number(process.env.ROUTER_PORT || 8090);
 const IDPHOTO = { host: '127.0.0.1', port: Number(process.env.IDPHOTO_PORT || 8088) };
-const C2A = { host: '127.0.0.1', port: Number(process.env.C2A_PORT || 38650) };
-const PREFIX = '/idphoto';
+const C2A = { host: '127.0.0.1', port: Number(process.env.FALLBACK_PORT || 38650) };
+const PREFIX = process.env.ROUTER_PREFIX || '/idphoto';
 
 function pick(url) {
   if (url === PREFIX || url.startsWith(PREFIX + '/') || url.startsWith(PREFIX + '?')) {
@@ -85,5 +89,5 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[router] http://127.0.0.1:${PORT}`);
   console.log(`[router] ${PREFIX}/* -> ${IDPHOTO.host}:${IDPHOTO.port} (idphoto)`);
-  console.log(`[router] /*        -> ${C2A.host}:${C2A.port} (chatgpt2api)`);
+  console.log(`[router] /*        -> ${C2A.host}:${C2A.port} (fallback)`);
 });

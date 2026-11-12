@@ -16,3 +16,4 @@ _zoom-*.png
 test-photo.*
 *.crdownload
 out/
+.env

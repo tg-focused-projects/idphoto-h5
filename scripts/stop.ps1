@@ -1,8 +1,8 @@
-# 停掉 idphoto 服务 / 路由 / ngrok
+# 停掉 idphoto 服务（8000）与 frpc 隧道
 #   powershell -ExecutionPolicy Bypass -File scripts\stop.ps1
 $ErrorActionPreference = 'SilentlyContinue'
 
-foreach ($port in 8088, 8090) {
+foreach ($port in 8000, 8088, 8090, 8095) {
   $conn = Get-NetTCPConnection -State Listen -LocalPort $port
   if ($conn) {
     Stop-Process -Id $conn[0].OwningProcess -Force
@@ -10,9 +10,9 @@ foreach ($port in 8088, 8090) {
   }
 }
 
-Get-Process ngrok | ForEach-Object {
+Get-Process frpc | ForEach-Object {
   Stop-Process -Id $_.Id -Force
-  Write-Host "已停 ngrok (pid $($_.Id))"
+  Write-Host "已停 frpc (pid $($_.Id))"
 }
 
-Write-Host '完成。注意：停掉 ngrok 会同时断开 38650 的公网入口。'
+Write-Host '完成。ngrok 未动（它是本机 chatgpt2api 38650 的通道，与本项目无关）。'

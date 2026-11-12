@@ -1,0 +1,27 @@
+# frpc 客户端配置：把本项目挂到自己的 frps 上（照本机 ComfyUI/Qwen 生图接口的做法）
+# ---------------------------------------------------------------
+# 本机原有做法（D:\Qwen-Image-Edit-2511\frpc.toml）：
+#   本地 8000（Qwen 生图 API） --tcp--> frps 110.40.183.197:8000
+#   公网地址 http://110.40.183.197:8000
+#
+# 现在 Qwen 那套不用了，8000 直接给本项目：
+#   本地 8000（本项目 server.mjs，公网模式） --tcp--> frps 110.40.183.197:8000
+#   公网 base = http://110.40.183.197:8000
+#
+# 实测 frps 只放行 remotePort = 8000（其它端口一律 "port not allowed"），
+# 所以不要再试别的公网端口。
+#
+# token 不写死：从环境变量 FRP_AUTH_TOKEN 取（scripts/start-tunnel.ps1 负责注入）。
+
+serverAddr = "110.40.183.197"
+serverPort = 7000
+
+auth.token = "{{ .Envs.FRP_AUTH_TOKEN }}"
+transport.tls.enable = true
+
+[[proxies]]
+name = "idphoto-api"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8000
+remotePort = 8000
