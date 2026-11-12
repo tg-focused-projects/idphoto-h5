@@ -4,6 +4,10 @@
 这一份是可直接跑的 **H5 版本**：纯静态前端 + 一个 Node 本地服务，换正装用本机号池的 `gpt-image-2` 做参考图编辑，
 构图裁剪 / 底色 / 300dpi / 冲印排版全在浏览器本地完成。
 
+| 首页 | 制作页 |
+|---|---|
+| ![首页](docs/screenshot-home.png) | ![制作页](docs/screenshot-make.png) |
+
 - 打开地址：**http://127.0.0.1:8088**
 - 起服务：`node server.mjs`（或 `npm start`）
 - 生图前提：DSH 在跑（`127.0.0.1:38650` 有 python 进程）+ 代理开着（`127.0.0.1:7890`）
@@ -163,9 +167,7 @@ Authorization: Bearer <~/.dsh/chatgpt2api-native/admin-key>
 
 ---
 
-## 五、接自己的 AppID / 商户号
-
-全在 `config.json`，当前一律留空、功能开关全关：
+## 五、接自己的 AppID / 商户号全在 `config.json`，当前一律留空、功能开关全关：
 
 ```json
 {
