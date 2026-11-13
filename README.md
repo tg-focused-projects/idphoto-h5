@@ -71,6 +71,7 @@ h5/
 │  ├─ public_api_client.mjs  公网客户端：参数化提交 → 轮询 → 取图
 │  ├─ param_api_test.mjs     参数化接口自测（sync/async、passes=1/2）
 │  ├─ make_suit_previews.mjs 生成 5 套正装的服装预览图（文生图，5 次额度）
+│  ├─ diagnose.mjs           五段链路连通性诊断（报 502/401 时先跑它）
 │  ├─ cdp_test.mjs           无头 Chrome(CDP) 跑完整 UI 链路
 │  ├─ probe_layout.mjs       量视口/grid 轨道，排查横向溢出
 │  └─ shot_mobile.mjs        390×844@2x 手机视口截图
@@ -299,6 +300,47 @@ powershell -ExecutionPolicy Bypass -File scripts\stop.ps1           # 停 8000 +
 - 只存在 `api-keys.json`（**已 gitignore**，支持多把：`{"keys":["sk-...","sk-..."]}`），或环境变量 `IDPHOTO_API_KEYS`。
 - 换 key：改文件 → 重启 `server.mjs`。
 - 仓库里不含任何 key；`config.json` 只有限流和 CORS 配置。
+### 4.9 排查：前端报 502 怎么办
+
+先跑一条命令，五段链路逐段验：
+
+```bash
+node tools/diagnose.mjs http://110.40.183.197:8000 <key>          # 不消耗额度
+node tools/diagnose.mjs http://110.40.183.197:8000 <key> --gen    # 真生成一张（1 次额度）
+```
+
+输出形如：
+
+```
+✔ TCP 连接         110.40.183.197:8000 可连
+✔ 公网到达服务         401 + JSON（缺少 Authorization: Bearer <key>）
+✔ 鉴权 + 后端        200，号池剩余 197 次，trace=f0120c7c
+✔ 请求体链路          400 + code=bad_params（符合预期）
+```
+
+**502 只有三种来源，看响应体就能分辨：**
+
+| 来源 | 响应体 | 常见原因 |
+|---|---|---|
+| 本服务（生图上游失败） | **JSON** `{ok:false, error, code, detail, trace_id}` | `upstream_policy` 提示词被拒 / `upstream_quota` 没额度 / `upstream_timeout` 超时 / `ref_download_failed` 参考图 URL 拉不到 |
+| 中间网关（nginx/CDN） | **HTML** `502 Bad Gateway` | 同步请求 40~90s，撞上网关 `proxy_read_timeout`（默认 60s） |
+| 隧道断了 | 浏览器层 `ERR_CONNECTION_*` | frpc 掉了 / 本机 8000 没起 |
+
+判断技巧：**502 在 ~60s 出现 → 网关超时；1s 内立刻出现 → 不是超时，是端口/隧道**。
+
+我们的错误响应一定带 `code` 和 `trace_id`，请让前端把这两个发过来，配合请求流水定位：
+
+```bash
+# 最近 300 条请求流水（时间/方法/路径/状态/耗时/IP/UA），需要 key
+curl -H "Authorization: Bearer <key>" "http://110.40.183.197:8000/api/requests?limit=50"
+```
+
+`server.log` 里也是每请求一行 JSON，`trace` 字段与响应头 `X-Trace-Id` 对应。
+
+**推荐的调用姿势**：公网一律用异步 `/v1/idphoto` + 轮询 `/v1/jobs/{id}`，
+同步 `/api/idphoto` 只给本机 H5 用——它要挂 40~90s，任何中间网关都容易掐。
+
+---
 
 ---
 

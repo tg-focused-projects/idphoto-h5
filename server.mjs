@@ -122,8 +122,13 @@ function corsHeaders(req) {
   };
 }
 
-function readBody(req, limit = 24 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
+/** 统一错误响应：带 trace_id + code，前端报错时把这两个发过来就能定位 */
+function fail(res, req, status, obj) {
+  const trace = String(res.getHeader('X-Trace-Id') || '');
+  return json(res, status, { ok: false, ...obj, trace_id: trace }, corsHeaders(req));
+}
+
+function readBody(req, limit = 24 * 1024 * 1024) {  return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
     req.on('data', (c) => {
@@ -220,19 +225,32 @@ async function backendStatus() {
 }
 
 /* ------------------------------------------------------- 调生图后端 */
+// 每个失败都带 code，前端看到 502 时能立刻区分是「上游拒绝」「没额度」「超时」还是「拉不到参考图」
+function upstreamError(code, message, extra = {}) {
+  const e = new Error(message);
+  e.code = code;
+  Object.assign(e, extra);
+  return e;
+}
+
 async function callImageApi({ image, prompt, size, model }) {
   const k = c2aKey();
-  if (!k) throw new Error('读不到 chatgpt2api admin-key（先启动一次 DSH）');
+  if (!k) throw upstreamError('backend_key_missing', '读不到 chatgpt2api admin-key（先启动一次 DSH）');
 
   let img;
   if (image.url) {
-    const r = await fetch(image.url, { signal: AbortSignal.timeout(30000) });
-    if (!r.ok) throw new Error(`下载参考图失败 HTTP ${r.status}`);
+    let r;
+    try {
+      r = await fetch(image.url, { signal: AbortSignal.timeout(30000) });
+    } catch (e) {
+      throw upstreamError('ref_download_failed', `参考图地址拉不到：${String(e.message || e)}`, { detail: String(image.url).slice(0, 200) });
+    }
+    if (!r.ok) throw upstreamError('ref_download_failed', `下载参考图失败 HTTP ${r.status}`, { detail: String(image.url).slice(0, 200) });
     img = { mime: r.headers.get('content-type') || 'image/jpeg', buffer: Buffer.from(await r.arrayBuffer()) };
   } else {
     img = image;
   }
-  if (img.buffer.length > 12 * 1024 * 1024) throw new Error('参考图超过 12MB');
+  if (img.buffer.length > 12 * 1024 * 1024) throw upstreamError('ref_too_large', '参考图超过 12MB');
 
   const payload = {
     model: model || 'gpt-image-2',
@@ -243,12 +261,20 @@ async function callImageApi({ image, prompt, size, model }) {
     images: [{ b64_json: img.buffer.toString('base64'), mime_type: img.mime, filename: 'reference-1.jpg' }],
   };
 
-  const r = await fetch(`${C2A_BASE}/v1/images/edits`, {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + k, 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(GEN_TIMEOUT_MS),
-  });
+  let r;
+  try {
+    r = await fetch(`${C2A_BASE}/v1/images/edits`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + k, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(GEN_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const timeout = /timeout|abort/i.test(String(e.message || e));
+    throw upstreamError(timeout ? 'upstream_timeout' : 'upstream_unreachable',
+      timeout ? `生图超时（${Math.round(GEN_TIMEOUT_MS / 1000)}s）` : '生图后端不可达',
+      { detail: String(e.message || e) });
+  }
   const text = await r.text();
   let b = null;
   try { b = JSON.parse(text); } catch {}
@@ -256,13 +282,14 @@ async function callImageApi({ image, prompt, size, model }) {
   if (!r.ok) {
     const detail = b?.detail?.error || b?.detail?.message || b?.error?.message || b?.error || text.slice(0, 300);
     const s = String(detail);
-    const hint = /content[_ ]policy|safety|违反|防护|敏感|挑逗|性暗示/i.test(s)
-      ? '上游内容策略拒绝：换成更「证件照」的描述'
-      : /no available image quota|quota/i.test(s) ? '号池额度不足：面板刷新额度或补号' : '';
-    const err = new Error(`生图失败 HTTP ${r.status}`);
-    err.detail = s.slice(0, 400);
-    err.hint = hint;
-    throw err;
+    const isPolicy = /content[_ ]policy|safety|违反|防护|敏感|挑逗|性暗示/i.test(s);
+    const isQuota = /no available image quota|quota/i.test(s);
+    throw upstreamError(isPolicy ? 'upstream_policy' : isQuota ? 'upstream_quota' : 'upstream_http',
+      `生图失败 HTTP ${r.status}`,
+      {
+        detail: s.slice(0, 400),
+        hint: isPolicy ? '上游内容策略拒绝：换成更「证件照」的描述' : isQuota ? '号池额度不足：面板刷新额度或补号' : '',
+      });
   }
 
   const first = b?.data?.[0];
@@ -306,6 +333,7 @@ function jobView(id, req) {
     model: j.model,
     size: j.size,
     passes: j.passes || 1,
+    trace_id: j.trace || null,
     poll_url: `${base}/v1/jobs/${id}`,
   };
   // 结构化入参的任务，把「后端最终拼出来的 prompt」也回给调用方，方便排查效果问题
@@ -390,6 +418,24 @@ async function runJob(id) {
   }
 }
 
+/* ------------------------------------------------------------ 请求日志 */
+// 每一次 API 请求都留一条：时间 / trace / 方法 / 路径 / 状态 / 耗时 / 上游错误。
+// 排查「前端说 502」这类问题时，先看这个，别靠猜。
+const RECENT = [];
+const RECENT_MAX = 300;
+
+function traceId() {
+  return crypto.randomBytes(4).toString('hex');
+}
+
+function record(entry) {
+  RECENT.push(entry);
+  if (RECENT.length > RECENT_MAX) RECENT.shift();
+  try {
+    console.log(JSON.stringify(entry));
+  } catch {}
+}
+
 /* -------------------------------------------------------------- 路由 */
 async function handleApi(req, res, url) {
   // /api/config 是给前端渲染用的非敏感配置（不含 key），公网模式下也放行
@@ -419,6 +465,16 @@ async function handleApi(req, res, url) {
     }, corsHeaders(req));
   }
 
+  // 最近的请求流水（排查用）：GET /api/requests?limit=50
+  if (req.method === 'GET' && url === '/api/requests') {
+    const limit = Math.min(300, Number(new URL(req.url, 'http://x').searchParams.get('limit') || 50));
+    return json(res, 200, {
+      ok: true,
+      count: RECENT.length,
+      items: RECENT.slice(-limit).reverse(),
+    }, corsHeaders(req));
+  }
+
   // 健康 / 状态
   if (req.method === 'GET' && (url === '/api/health' || url === '/api/status')) {
     return json(res, 200, {
@@ -435,10 +491,10 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && url === '/api/generate') {
     let body;
     try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) {
-      return json(res, 400, { ok: false, error: '请求体不是合法 JSON：' + e.message }, corsHeaders(req));
+      return fail(res, req, 400, { error: '请求体不是合法 JSON：' + e.message, code: 'bad_json' });
     }
     const prompt = String(body.prompt || '').trim();
-    if (!prompt) return json(res, 400, { ok: false, error: '缺少 prompt' }, corsHeaders(req));
+    if (!prompt) return fail(res, req, 400, { error: '缺少 prompt', code: 'missing_prompt' });
     let image;
     try { image = parseImage(body.image); } catch (e) {
       return json(res, 400, { ok: false, error: e.message }, corsHeaders(req));
@@ -456,8 +512,8 @@ async function handleApi(req, res, url) {
         model: body.model || 'gpt-image-2',
       }, corsHeaders(req));
     } catch (e) {
-      const code = /超时|timeout/i.test(String(e.message)) ? 504 : 502;
-      return json(res, code, { ok: false, error: e.message, detail: e.detail, hint: e.hint }, corsHeaders(req));
+      const status = e.code === 'upstream_timeout' ? 504 : 502;
+      return fail(res, req, status, { error: e.message, code: e.code || null, detail: e.detail || null, hint: e.hint || null });
     }
   }
 
@@ -467,10 +523,10 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && url === '/api/idphoto') {
     let body;
     try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) {
-      return json(res, 400, { ok: false, error: '请求体不是合法 JSON：' + e.message }, corsHeaders(req));
+      return fail(res, req, 400, { error: '请求体不是合法 JSON：' + e.message, code: 'bad_json' });
     }
     const norm = normalizeParams(body);
-    if (!norm.ok) return json(res, 400, { ok: false, error: norm.error }, corsHeaders(req));
+    if (!norm.ok) return fail(res, req, 400, { error: norm.error, code: 'bad_params' });
     let image;
     try { image = parseImage(body.image); } catch (e) {
       return json(res, 400, { ok: false, error: e.message }, corsHeaders(req));
@@ -509,8 +565,10 @@ async function handleApi(req, res, url) {
         model: body.model || 'gpt-image-2',
       }, corsHeaders(req));
     } catch (e) {
-      const code = /超时|timeout/i.test(String(e.message)) ? 504 : 502;
-      return json(res, code, { ok: false, error: e.message, detail: e.detail, hint: e.hint, prompt }, corsHeaders(req));
+      const status = e.code === 'upstream_timeout' ? 504 : 502;
+      return fail(res, req, status, {
+        error: e.message, code: e.code || null, detail: e.detail || null, hint: e.hint || null, prompt,
+      });
     }
   }
 
@@ -519,16 +577,16 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && url === '/v1/idphoto') {
     let body;
     try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) {
-      return json(res, 400, { ok: false, error: '请求体不是合法 JSON：' + e.message }, corsHeaders(req));
+      return fail(res, req, 400, { error: '请求体不是合法 JSON：' + e.message, code: 'bad_json' });
     }
     const norm = normalizeParams(body);
-    if (!norm.ok) return json(res, 400, { ok: false, error: norm.error }, corsHeaders(req));
+    if (!norm.ok) return fail(res, req, 400, { error: norm.error, code: 'bad_params' });
     let image;
     try { image = parseImage(body.image); } catch (e) {
       return json(res, 400, { ok: false, error: e.message }, corsHeaders(req));
     }
     if (image.buffer && image.buffer.length > 12 * 1024 * 1024) {
-      return json(res, 413, { ok: false, error: '参考图超过 12MB' }, corsHeaders(req));
+      return fail(res, req, 413, { error: '参考图超过 12MB', code: 'ref_too_large' });
     }
 
     const params = norm.params;
@@ -536,7 +594,7 @@ async function handleApi(req, res, url) {
     const id = newJobId();
     const job = {
       status: 'pending', createdAt: Date.now(), startedAt: 0, finishedAt: 0,
-      image, prompt, params, paramsSummary: describeParams(params),
+      image, prompt, params, paramsSummary: describeParams(params), trace: String(res.getHeader('X-Trace-Id') || ''),
       passes: params.refineOnly ? 1 : params.passes,
       refinePrompt: (!params.refineOnly && params.passes === 2) ? buildRefinePrompt(params) : null,
       size: params.size,
@@ -562,22 +620,23 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && (url === '/v1/jobs' || url === '/api/jobs')) {
     let body;
     try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) {
-      return json(res, 400, { ok: false, error: '请求体不是合法 JSON：' + e.message }, corsHeaders(req));
+      return fail(res, req, 400, { error: '请求体不是合法 JSON：' + e.message, code: 'bad_json' });
     }
     const prompt = String(body.prompt || '').trim();
-    if (!prompt) return json(res, 400, { ok: false, error: '缺少 prompt' }, corsHeaders(req));
+    if (!prompt) return fail(res, req, 400, { error: '缺少 prompt', code: 'missing_prompt' });
     let image;
     try { image = parseImage(body.image); } catch (e) {
       return json(res, 400, { ok: false, error: e.message }, corsHeaders(req));
     }
     if (image.buffer && image.buffer.length > 12 * 1024 * 1024) {
-      return json(res, 413, { ok: false, error: '参考图超过 12MB' }, corsHeaders(req));
+      return fail(res, req, 413, { error: '参考图超过 12MB', code: 'ref_too_large' });
     }
 
     const id = newJobId();
     const job = {
       status: 'pending', createdAt: Date.now(), startedAt: 0, finishedAt: 0,
       image, prompt, size: body.size || CONFIG.gen?.size, model: body.model || CONFIG.gen?.model || 'gpt-image-2',
+      trace: String(res.getHeader('X-Trace-Id') || ''),
     };
     jobs.set(id, job);
     setImmediate(() => runJob(id));
@@ -655,20 +714,41 @@ async function serveStatic(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   const url = (req.url || '/').split('?')[0];
+  const trace = traceId();
+  const t0 = Date.now();
+  res.setHeader('X-Trace-Id', trace);
+
+  const isApi = url === '/api/health' || url === '/api/status' || url === '/api/config'
+    || url === '/api/options' || url === '/v1/options' || url === '/api/requests'
+    || url === '/api/idphoto' || url === '/v1/idphoto'
+    || url.startsWith('/api/generate') || url.startsWith('/v1/jobs') || url.startsWith('/api/jobs');
+
+  if (isApi) {
+    res.on('finish', () => {
+      record({
+        ts: new Date().toISOString(),
+        trace,
+        method: req.method,
+        path: url,
+        status: res.statusCode,
+        ms: Date.now() - t0,
+        ip: (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(),
+        ua: String(req.headers['user-agent'] || '').slice(0, 60),
+        bytes: Number(req.headers['content-length'] || 0),
+      });
+    });
+  }
+
   try {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, corsHeaders(req));
       return res.end();
     }
-    const isApi = url === '/api/health' || url === '/api/status' || url === '/api/config'
-      || url === '/api/options' || url === '/v1/options'
-      || url === '/api/idphoto' || url === '/v1/idphoto'
-      || url.startsWith('/api/generate') || url.startsWith('/v1/jobs') || url.startsWith('/api/jobs');
     if (isApi) return await handleApi(req, res, url);
     if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { ok: false, error: 'method not allowed' });
     return await serveStatic(req, res, url);
   } catch (e) {
-    return json(res, 500, { ok: false, error: String(e?.message || e) }, corsHeaders(req));
+    return json(res, 500, { ok: false, error: String(e?.message || e), trace_id: trace }, corsHeaders(req));
   }
 });
 
