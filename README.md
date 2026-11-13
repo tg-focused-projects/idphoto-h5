@@ -72,6 +72,7 @@ h5/
 │  ├─ param_api_test.mjs     参数化接口自测（sync/async、passes=1/2）
 │  ├─ make_suit_previews.mjs 生成 5 套正装的服装预览图（文生图，5 次额度）
 │  ├─ diagnose.mjs           五段链路连通性诊断（报 502/401 时先跑它）
+│  ├─ repro_conn_reset.mjs   复现 keep-alive 陈旧连接导致的 ECONNRESET
 │  ├─ cdp_test.mjs           无头 Chrome(CDP) 跑完整 UI 链路
 │  ├─ probe_layout.mjs       量视口/grid 轨道，排查横向溢出
 │  └─ shot_mobile.mjs        390×844@2x 手机视口截图
@@ -339,6 +340,43 @@ curl -H "Authorization: Bearer <key>" "http://110.40.183.197:8000/api/requests?l
 
 **推荐的调用姿势**：公网一律用异步 `/v1/idphoto` + 轮询 `/v1/jobs/{id}`，
 同步 `/api/idphoto` 只给本机 H5 用——它要挂 40~90s，任何中间网关都容易掐。
+
+#### 已修复：客户端约 5s 收不到响应 / `upstream_connection`
+
+**现象**：客户端（Nuxt/h3、nginx、各类网关）POST 到 `/v1/idphoto`，约 5 秒后拿不到任何 HTTP 响应，
+自己返回 `502 upstream_connection`；而我们这边的请求流水里**根本没有这条请求**。
+
+**根因**：Node 的 HTTP server `keepAliveTimeout` 默认是 **5000ms**——响应完 5 秒就关掉空闲长连接。
+但客户端会把这些连接放进池子复用，等它第二次发请求时，连接已经被我们关了：
+
+```
+客户端 → frps:8000 → frpc → 本机 8000（Node）
+                                    └─ 空闲 5s 后主动 FIN，frps 那条边缘连接随之失效
+客户端复用死连接发请求 → 收不到响应 → upstream_connection 502
+```
+
+这也是为什么「客户端等了 5 秒」和「我们的日志里没有这条请求」能同时成立。
+
+**复现方式**（`tools/repro_conn_reset.mjs`）：keep-alive 池化连接空闲 30s 后再发请求 → `ECONNRESET socket hang up`。
+空闲 8s 正常、30s 必挂，正好卡在 5s 这个默认值上。
+
+**修复**（`server.mjs` 启动前）：
+
+```js
+server.keepAliveTimeout = 120_000;   // 原来是默认 5000
+server.headersTimeout = 125_000;     // 必须大于 keepAliveTimeout
+server.requestTimeout = 600_000;     // 同步生成 40~90s 也别被掐
+server.keepAliveTimeoutBuffer = 5_000; // 超时前主动发 FIN
+```
+
+可用环境变量覆盖：`KEEPALIVE_TIMEOUT_MS` / `REQUEST_TIMEOUT_MS`。
+修复后同一个脚本 T5(30s)/T6(60s) 全部通过，响应头也会广告 `Keep-Alive: timeout=120`。
+
+**客户端建议**：即使服务端修好了，客户端也最好显式设置连接池空闲时间
+（undici：`new Agent({ keepAliveTimeout: 10_000, keepAliveMaxTimeout: 60_000, connections: 10 })`），
+并给代理转发配置 `proxy_next_upstream error timeout` / 重试一次——stale connection 是长连接池的通病，两边都设才稳。
+
+另外：请求流水现在会记录 `X-Request-ID`（如果客户端带了），字段名 `req_id`，方便跟你们的链路追踪对账。
 
 ---
 

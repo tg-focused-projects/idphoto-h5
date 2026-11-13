@@ -735,7 +735,25 @@ const server = http.createServer(async (req, res) => {
         ip: (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(),
         ua: String(req.headers['user-agent'] || '').slice(0, 60),
         bytes: Number(req.headers['content-length'] || 0),
+        req_id: String(req.headers['x-request-id'] || '').slice(0, 64) || null,
       });
+    });
+    // 连接在响应前就断了（客户端 stale keep-alive / 中间设备掐断）——这类问题以前是"什么都看不到"
+    res.on('close', () => {
+      if (!res.writableFinished) {
+        record({
+          ts: new Date().toISOString(),
+          trace,
+          method: req.method,
+          path: url,
+          status: 0,
+          aborted: true,
+          ms: Date.now() - t0,
+          ip: (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(),
+          ua: String(req.headers['user-agent'] || '').slice(0, 60),
+          req_id: String(req.headers['x-request-id'] || '').slice(0, 64) || null,
+        });
+      }
     });
   }
 
@@ -751,6 +769,19 @@ const server = http.createServer(async (req, res) => {
     return json(res, 500, { ok: false, error: String(e?.message || e), trace_id: trace }, corsHeaders(req));
   }
 });
+
+// ── 连接复用相关的超时（这里有坑，见 README 4.9）─────────────────────────────
+// Node 默认 keepAliveTimeout = 5000ms：响应完 5 秒就关掉空闲长连接。
+// 客户端（Nuxt/undici、nginx、各类网关）会把这些连接放进池子复用，
+// 但池子里的连接已经被我们关掉了 → 下一次请求发在死 socket 上，
+// 客户端收不到任何 HTTP 响应，只能报 upstream_connection / 502。
+// 经 frp 转发时更明显：本地 socket 一关，frps 那条边缘连接也跟着失效。
+server.keepAliveTimeout = Number(process.env.KEEPALIVE_TIMEOUT_MS || 120_000);
+server.headersTimeout = server.keepAliveTimeout + 5_000;   // 必须大于 keepAliveTimeout
+server.requestTimeout = Number(process.env.REQUEST_TIMEOUT_MS || 600_000);  // 同步生成 40~90s 也别被掐
+server.timeout = 0;
+// 让服务端在超时前主动发 FIN，客户端就不会把连接当成"还活着"（Node ≥20.11）
+if ('keepAliveTimeoutBuffer' in server) server.keepAliveTimeoutBuffer = 5_000;
 
 server.listen(PORT, HOST, () => {
   const s = backendStatus();
