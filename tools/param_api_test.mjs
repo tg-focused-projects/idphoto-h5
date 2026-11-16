@@ -1,16 +1,14 @@
-/**
- * 参数化接口自测（不依赖浏览器）
- *   node tools/param_api_test.mjs <照片> <baseURL> <apiKey> [sync|async] [passes]
+﻿/**
+ * 鍙傛暟鍖栨帴鍙ｈ嚜娴嬶紙涓嶄緷璧栨祻瑙堝櫒锛? *   node tools/param_api_test.mjs <鐓х墖> <baseURL> <apiKey> [sync|async] [passes]
  *
- * 走新接口：POST /v1/idphoto（异步）或 /api/idphoto（同步），前端只传参数，
- * 提示词由后端 lib/prompt.mjs 拼。
- */
+ * 璧版柊鎺ュ彛锛歅OST /v1/idphoto锛堝紓姝ワ級鎴?/api/idphoto锛堝悓姝ワ級锛屽墠绔彧浼犲弬鏁帮紝
+ * 鎻愮ず璇嶇敱鍚庣 lib/prompt.mjs 鎷笺€? */
 import fs from 'node:fs';
 import path from 'node:path';
 
 const [, , photo, baseArg, key, mode = 'async', passesArg = '1'] = process.argv;
 if (!photo || !baseArg || !key) {
-  console.error('用法: node tools/param_api_test.mjs <照片> <baseURL> <apiKey> [sync|async] [1|2]');
+  console.error('鐢ㄦ硶: node tools/param_api_test.mjs <鐓х墖> <baseURL> <apiKey> [sync|async] [1|2]');
   process.exit(2);
 }
 const base = baseArg.replace(/\/+$/, '');
@@ -58,15 +56,16 @@ if (mode === 'sync') {
 
   let view;
   for (let i = 0; i < 300; i++) {
-    await new Promise((r2) => setTimeout(r2, 3000));
+    await new Promise((r2) => setTimeout(r2, 1000));
     view = await (await fetch(`${base}/v1/jobs/${job.job_id}`, { headers: { Authorization: `Bearer ${key}` } })).json();
     process.stdout.write(`\r  [${((Date.now() - t0) / 1000).toFixed(0)}s] ${view.status}          `);
     if (view.status === 'succeeded' || view.status === 'failed') break;
   }
   console.log('');
   if (view.status !== 'succeeded') { console.error(JSON.stringify(view)); process.exit(1); }
-  console.log(`result: ${view.result.url}  ${(view.result.bytes / 1024).toFixed(0)}KB  总耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  console.log(`result: ${view.result.url}  ${(view.result.bytes / 1024).toFixed(0)}KB  鎬昏€楁椂 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   if (view.result.jpeg_url) console.log(`jpeg:   ${view.result.jpeg_url}  ${(view.result.jpeg_bytes / 1024).toFixed(0)}KB`);
-  if (view.result.first_pass_url) console.log(`第一轮: ${view.result.first_pass_url}`);
-  if (view.result.refine_prompt) console.log(`精修提示词: ${view.result.refine_prompt}`);
+  if (view.result.first_pass_url) console.log(`绗竴杞? ${view.result.first_pass_url}`);
+  if (view.result.refine_prompt) console.log(`绮句慨鎻愮ず璇? ${view.result.refine_prompt}`);
 }
+

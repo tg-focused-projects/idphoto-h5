@@ -22,3 +22,4 @@ watchdog.log
 watchdog.out.log
 watchdog.err.log
 watch.log
+outputs/.cache.json

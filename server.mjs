@@ -30,6 +30,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { toJpeg } from './lib/jpeg.mjs';
 import {
@@ -116,7 +117,7 @@ function corsHeaders(req) {
   if (!allow) return {};
   return {
     'Access-Control-Allow-Origin': allow,
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, Content-Encoding, X-Request-ID',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Max-Age': '600',
     ...(allow === '*' ? {} : { Vary: 'Origin' }),
@@ -129,15 +130,30 @@ function fail(res, req, status, obj) {
   return json(res, status, { ok: false, ...obj, trace_id: trace }, corsHeaders(req));
 }
 
-function readBody(req, limit = 24 * 1024 * 1024) {  return new Promise((resolve, reject) => {
+/**
+ * 读请求体。支持 Content-Encoding: gzip —— 公网带宽是主要瓶颈，
+ * base64 的 JSON gzip 之后通常只剩 70~75%（base64 膨胀的那 33% 大部分能被压回来）。
+ */
+function readBody(req, limit = 24 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    const enc = String(req.headers['content-encoding'] || '').toLowerCase();
+    const cap = enc === 'gzip' ? limit * 4 : limit;   // 压缩后的体积上限放宽（解压后仍卡 limit）
     req.on('data', (c) => {
       size += c.length;
-      if (size > limit) { reject(new Error('请求体过大（照片压到 12MB 内）')); req.destroy(); return; }
+      if (size > cap) { reject(new Error('请求体过大（照片压到 12MB 内）')); req.destroy(); return; }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks);
+      if (enc !== 'gzip') return resolve(raw);
+      try {
+        resolve(zlib.gunzipSync(raw, { maxOutputLength: limit }));
+      } catch (e) {
+        reject(new Error('gzip 解压失败（Content-Encoding: gzip 但内容不是 gzip）：' + e.message));
+      }
+    });
     req.on('error', reject);
   });
 }
@@ -234,6 +250,50 @@ function upstreamError(code, message, extra = {}) {
   return e;
 }
 
+/* ------------------------------------------------------------ 结果缓存 */
+// 同样的图 + 同样的参数 → 直接给上次的结果。前端重试、用户反复调参数预览时能省掉 35~130 秒。
+// 索引落盘到 outputs/.cache.json，重启后仍然有效；24 小时过期。
+const CACHE_FILE = path.join(OUT_DIR, '.cache.json');
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 24 * 3600 * 1000);
+let CACHE = (() => {
+  try { return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')); } catch { return {}; }
+})();
+
+function cacheKey(imgBuf, params, size, model) {
+  const h = crypto.createHash('sha256');
+  h.update(imgBuf);
+  h.update('|' + JSON.stringify(params || {}));
+  h.update('|' + String(size || ''));
+  h.update('|' + String(model || ''));
+  return h.digest('hex').slice(0, 32);
+}
+
+function cacheGet(key) {
+  const e = CACHE[key];
+  if (!e) return null;
+  if (Date.now() - e.ts > CACHE_TTL_MS) { delete CACHE[key]; return null; }
+  const png = path.join(OUT_DIR, e.name);
+  if (!fs.existsSync(png)) { delete CACHE[key]; return null; }
+  const jpeg = e.jpegName && fs.existsSync(path.join(OUT_DIR, e.jpegName))
+    ? { name: e.jpegName, bytes: e.jpegBytes }
+    : null;
+  return { name: e.name, bytes: e.bytes, jpeg, cached: true };
+}
+
+function cacheSet(key, res) {
+  CACHE[key] = {
+    name: res.name, bytes: res.bytes,
+    jpegName: res.jpeg?.name || null, jpegBytes: res.jpeg?.bytes || null,
+    ts: Date.now(),
+  };
+  try {
+    // 顺手清理过期项，避免文件无限增长
+    const now = Date.now();
+    for (const [k, v] of Object.entries(CACHE)) if (now - v.ts > CACHE_TTL_MS) delete CACHE[k];
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(CACHE));
+  } catch {}
+}
+
 async function callImageApi({ image, prompt, size, model }) {
   const k = c2aKey();
   if (!k) throw upstreamError('backend_key_missing', '读不到 chatgpt2api admin-key（先启动一次 DSH）');
@@ -253,8 +313,14 @@ async function callImageApi({ image, prompt, size, model }) {
   }
   if (img.buffer.length > 12 * 1024 * 1024) throw upstreamError('ref_too_large', '参考图超过 12MB');
 
+  // 命中缓存直接返回（0 额度、毫秒级）
+  const mdl = model || 'gpt-image-2';
+  const ck = cacheKey(img.buffer, { prompt, size, model: mdl });
+  const hit = cacheGet(ck);
+  if (hit) return hit;
+
   const payload = {
-    model: model || 'gpt-image-2',
+    model: mdl,
     prompt,
     n: 1,
     response_format: 'b64_json',
@@ -312,7 +378,9 @@ async function callImageApi({ image, prompt, size, model }) {
     jpeg = await toJpeg(full, { quality: Number(CONFIG.gen?.jpeg?.quality ?? 88) });
   }
 
-  return { name, bytes: bytes.length, jpeg };
+  const res = { name, bytes: bytes.length, jpeg };
+  cacheSet(ck, res);
+  return res;
 }
 
 /* ------------------------------------------------------------ 任务队列 */
@@ -346,6 +414,7 @@ function jobView(id, req) {
   if (j.status === 'succeeded') {
     view.result = {
       url: `${base}/files/${j.result.name}`,
+      cached: !!j.result.cached,
       bytes: j.result.bytes,
       width: j.result.width || null,
       height: j.result.height || null,
@@ -506,6 +575,7 @@ async function handleApi(req, res, url) {
       return json(res, 200, {
         ok: true,
         url: '/files/' + out.name,
+        cached: !!out.cached,
         jpeg_url: out.jpeg ? '/files/' + out.jpeg.name : null,
         bytes: out.bytes,
         jpeg_bytes: out.jpeg?.bytes ?? null,
@@ -558,6 +628,7 @@ async function handleApi(req, res, url) {
         prompt,
         ...(refinePrompt ? { refine_prompt: refinePrompt } : {}),
         url: '/files/' + out.name,
+        cached: !!out.cached,
         jpeg_url: out.jpeg ? '/files/' + out.jpeg.name : null,
         bytes: out.bytes,
         jpeg_bytes: out.jpeg?.bytes ?? null,
@@ -592,6 +663,31 @@ async function handleApi(req, res, url) {
 
     const params = norm.params;
     const prompt = params.refineOnly ? buildRefinePrompt(params) : buildPrompt(params);
+    const mdl = body.model || CONFIG.gen?.model || 'gpt-image-2';
+
+    // 命中缓存：直接 200 + result，不用再给 job_id 让客户端轮询
+    if (image.buffer) {
+      const hit = cacheGet(cacheKey(image.buffer, { prompt, size: params.size, model: mdl }));
+      if (hit) {
+        const base = publicBase(req);
+        return json(res, 200, {
+          ok: true,
+          cached: true,
+          status: 'succeeded',
+          params,
+          params_summary: describeParams(params),
+          prompt,
+          result: {
+            url: `${base}/files/${hit.name}`,
+            cached: true,
+            bytes: hit.bytes,
+            jpeg_url: hit.jpeg ? `${base}/files/${hit.jpeg.name}` : null,
+            jpeg_bytes: hit.jpeg?.bytes ?? null,
+          },
+        }, corsHeaders(req));
+      }
+    }
+
     const id = newJobId();
     const job = {
       status: 'pending', createdAt: Date.now(), startedAt: 0, finishedAt: 0,
@@ -599,7 +695,7 @@ async function handleApi(req, res, url) {
       passes: params.refineOnly ? 1 : params.passes,
       refinePrompt: (!params.refineOnly && params.passes === 2) ? buildRefinePrompt(params) : null,
       size: params.size,
-      model: body.model || CONFIG.gen?.model || 'gpt-image-2',
+      model: mdl,
     };
     jobs.set(id, job);
     setImmediate(() => runJob(id));
