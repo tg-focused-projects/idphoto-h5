@@ -1,4 +1,4 @@
-# 停掉 idphoto 服务（8000）与 frpc 隧道
+﻿# 停掉 idphoto 服务（8000）与 frpc 隧道
 #   powershell -ExecutionPolicy Bypass -File scripts\stop.ps1
 $ErrorActionPreference = 'SilentlyContinue'
 

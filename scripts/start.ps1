@@ -1,4 +1,4 @@
-# 一键起「生图后端（8000，公网模式）+ frpc 隧道」
+﻿# 一键起「生图后端（8000，公网模式）+ frpc 隧道」
 #   powershell -ExecutionPolicy Bypass -File scripts\start.ps1
 #
 # 结果：

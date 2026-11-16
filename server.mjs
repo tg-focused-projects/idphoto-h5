@@ -45,7 +45,8 @@ const PORT = Number(process.env.PORT || 8088);
 const HOST = process.env.HOST || '127.0.0.1';
 
 const C2A_BASE = process.env.C2A_BASE || 'http://127.0.0.1:38650';
-const C2A_KEY_FILE = path.join(os.homedir(), '.dsh', 'chatgpt2api-native', 'admin-key');
+// 用 C2A_KEY_FILE 显式指定；不指定时才回落到当前用户的 ~/.dsh（计划任务以 SYSTEM 跑时 homedir 不同，必须显式给）
+const C2A_KEY_FILE = process.env.C2A_KEY_FILE || path.join(os.homedir(), '.dsh', 'chatgpt2api-native', 'admin-key');
 const GEN_TIMEOUT_MS = Number(process.env.GEN_TIMEOUT_MS || 420_000);
 
 const PUBLIC_MARKER = 'x-idphoto-public';

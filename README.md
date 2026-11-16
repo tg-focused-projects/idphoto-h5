@@ -66,6 +66,8 @@ h5/
 ├─ scripts/start.ps1       一键起 8000（公网模式）+ frpc
 ├─ scripts/start-tunnel.ps1  单独起 frpc（token 从环境变量/.env 注入）
 ├─ scripts/stop.ps1        停 8000 + frpc
+├─ scripts/watch.ps1       一次性体检/修复（watchdog 内部也调它）
+├─ scripts/startup-idphoto-watch.vbs  放「启动」文件夹，随登录拉起 watchdog
 ├─ test_generate.mjs       不走浏览器，直接打接口验证后端链路
 ├─ tools/
 │  ├─ public_api_client.mjs  公网客户端：参数化提交 → 轮询 → 取图
@@ -73,6 +75,7 @@ h5/
 │  ├─ make_suit_previews.mjs 生成 5 套正装的服装预览图（文生图，5 次额度）
 │  ├─ diagnose.mjs           五段链路连通性诊断（报 502/401 时先跑它）
 │  ├─ repro_conn_reset.mjs   复现 keep-alive 陈旧连接导致的 ECONNRESET
+│  ├─ watchdog.mjs           守护：30s 一轮保证 8000 + frpc 一直活着
 │  ├─ cdp_test.mjs           无头 Chrome(CDP) 跑完整 UI 链路
 │  ├─ probe_layout.mjs       量视口/grid 轨道，排查横向溢出
 │  └─ shot_mobile.mjs        390×844@2x 手机视口截图
@@ -382,6 +385,45 @@ server.keepAliveTimeoutBuffer = 5_000; // 超时前主动发 FIN
 
 ---
 
+### 4.10 守护：服务静默死掉过 2 天
+
+**事故**：11-14 00:22 之后本机 
+ode server.mjs 和 rpc 都不在了（server.log 最后一条 00:21:41，
+无 crash 记录，server.err.log 为空），11-16 18:36 前端的请求打进来时**根本没有人应答**——
+他们的 502 是「连上了但拿不到响应」，不是我们返回的 502。之前那条 5s keep-alive 的修复是对的，但这次是另一回事：**入口整个没了**。
+
+**原因**：这两个进程是本会话里用 Start-Process 起的，没有守护；DSH 进程重启时被一起带走，之后没人拉起来。
+
+**现在的做法**（	ools/watchdog.mjs，30 秒一轮）：
+
+| 检查 | 动作 |
+|---|---|
+| 8000 没监听 | 起 server.mjs（PORT=8000 IDPHOTO_PUBLIC=1 C2A_KEY_FILE=…） |
+| 本地 health 不是 200/401 | 杀掉重启（卡死的情况） |
+| rpc 进程不在 | 起 frpc（token 从 .env 注入） |
+| 本地正常但公网不通 | 重启 frpc（隧道假死） |
+
+- 独立 node 进程，**不依赖 DSH 会话**；只在有动作时写 watchdog.log。
+- 开机自启：scripts/startup-idphoto-watch.vbs 已放进
+  %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\idphoto-watch.vbs。
+- 实测：杀掉 node + frpc 后 **5 秒**自动恢复。
+
+> 为什么不用计划任务：这台机器的会话是**非提权**的 Administrator（elevated=False），
+> schtasks /Create 直接 Access is denied，所以走「启动」文件夹 + 独立进程这条路。
+>
+> 为什么守护用 node 不用 PowerShell：PS 5.1 读 .ps1 按 ANSI 解码，**含中文的脚本必须存成 UTF-8 with BOM**，
+> 否则中文串会被截断导致解析错误；scripts/*.ps1 现在都是带 BOM 的。守护逻辑干脆用 node 写，行为稳定。
+
+**人工体检**：
+
+`powershell
+curl.exe -s -o NUL -w "%{http_code}" http://110.40.183.197:8000/api/health   # 401 就是正常的
+Get-Content watchdog.log -Tail 20                                            # 守护做过什么
+Get-Process frpc; Get-NetTCPConnection -State Listen -LocalPort 8000         # 进程/端口
+node tools/diagnose.mjs http://110.40.183.197:8000 <key>                     # 五段链路
+`
+
+---
 ## 五、验证记录（本机实跑）
 
 ### 5.1 真实自拍（1080×1920，室内杂背景，有胡渣）

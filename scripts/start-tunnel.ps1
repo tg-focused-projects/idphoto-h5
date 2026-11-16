@@ -1,4 +1,4 @@
-# 启动 frpc：把本地 8000 映射到 frps 110.40.183.197:8000
+﻿# 启动 frpc：把本地 8000 映射到 frps 110.40.183.197:8000
 #   powershell -ExecutionPolicy Bypass -File scripts\start-tunnel.ps1
 #
 # token 解析顺序：

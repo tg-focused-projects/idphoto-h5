@@ -17,3 +17,8 @@ test-photo.*
 *.crdownload
 out/
 .env
+.watch-loop.lock
+watchdog.log
+watchdog.out.log
+watchdog.err.log
+watch.log
