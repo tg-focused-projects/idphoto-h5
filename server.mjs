@@ -353,7 +353,7 @@ async function callImageApi({ image, prompt, size, model }) {
           timeout ? `生图超时（${Math.round(GEN_TIMEOUT_MS / 1000)}s）` : `生图后端不可达（${C2A_BASE}）`,
           {
             detail: `attempt=${attempt + 1} ${String(e.message || e)}${causeCode ? ' [' + causeCode + ']' : ''}`,
-            hint: 确认 chatgpt2api 后端在  监听；38650 无监听时守护会自动拉起（约 60s 内生效）,
+            hint: `确认 chatgpt2api 后端在 ${C2A_BASE} 监听；38650 无监听时守护会自动拉起（约 60s 内生效）`,
           });
       }
       await new Promise((res) => setTimeout(res, delays[attempt]));
