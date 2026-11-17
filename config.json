@@ -31,6 +31,7 @@
   "commercial": {
     "_comment": "按张付费：默认关闭。开启后 /files/* 必须带签名 URL，未付费只能拿带水印预览。价格/有效期待产品确认。",
     "enabled": false,
+    "payStub": false,
     "price": 4.9,
     "currency": "CNY",
     "freePerWindow": 1,

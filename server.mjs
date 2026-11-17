@@ -95,6 +95,7 @@ const COMMERCIAL = {
   watermark: (CONFIG.commercial || {}).watermark || { text: '证件照预览 · 解锁后无水印', opacity: 0.1 },
 };
 
+const PAY_STUB = String(process.env.PAY_STUB ?? ((CONFIG.commercial || {}).payStub ? '1' : '0')) === '1';
 const DATA_DIR = path.join(__dirname, 'data');
 const SESS_FILE = path.join(DATA_DIR, 'sessions.json');
 const ORDER_FILE = path.join(DATA_DIR, 'orders.json');
@@ -1121,6 +1122,14 @@ async function handleApi(req, res, url) {
     }
     if (req.method === 'POST' && om[2]) {
       if (ord.status === 'paid') return json(res, 200, { ok: true, ...ord }, corsHeaders(req));
+      // 未接真实支付前不允许「点一下就变已支付」——否则任何会话都能免费解锁
+      if (!PAY_STUB) {
+        return fail(res, req, 501, {
+          error: '支付通道未接入',
+          code: 'payment_not_configured',
+          hint: '接入微信支付后由支付回调把订单置为 paid；本地联调可设环境变量 PAY_STUB=1',
+        });
+      }
       ord.status = 'paid';
       ord.paidAt = Date.now();
       const s = sessOf(ord.sid);
