@@ -28,6 +28,16 @@
       "quality": 88
     }
   },
+  "commercial": {
+    "_comment": "按张付费：默认关闭。开启后 /files/* 必须带签名 URL，未付费只能拿带水印预览。价格/有效期待产品确认。",
+    "enabled": false,
+    "price": 4.9,
+    "currency": "CNY",
+    "freePerWindow": 1,
+    "windowHours": 24,
+    "previewTtlHours": 24,
+    "watermark": { "text": "证件照预览 · 解锁后无水印", "opacity": 0.1 }
+  },
   "api": {
     "_comment": "公网 API 配置。key 不写在这里，放 api-keys.json（已 gitignore）或环境变量 IDPHOTO_API_KEYS。public=true 时所有 /api/* /v1/* 都强制 Bearer（公网部署用；本地同源开发保持 false）。",
     "public": false,

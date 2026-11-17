@@ -520,6 +520,35 @@ node tools/bench_public.mjs gen    http://110.40.183.197:8000 <key> <照片> 102
 `
 
 ---
+### 4.12 商业化：免费额度 / 水印 / 签名取图 / 订单（默认关闭）
+
+config.json → commercial.enabled 打开，或 COMMERCIAL=1 启动。**关闭时行为与之前完全一致。**
+
+| 能力 | 实现 |
+|---|---|
+| 匿名会话 | Cookie idp_sid（HttpOnly，30 天），额度按会话记 |
+| 免费额度 | 每 24h 1 次**成功**生成；失败不扣；缓存命中不扣 |
+| 同会话单飞 | 已有 pending/running 任务时重复提交返回同一个 job_id（deduped） |
+| 额度用完 | 402 + code=free_quota_exhausted + 
+ext_free_at + price |
+| 水印 | 一次生成 → 本地派生 <name>.preview.jpg（斜向平铺文字，1000px 宽，约 160KB），**不多扣额度** |
+| 取图权限 | 开启后 /files/* **必须带签名**（?exp=&sig= HMAC），未付费只拿得到水印图 |
+| 订单 | POST /v1/orders {job_id} 解锁已有预览 / {type:"new_photo"} 买一次生成；POST /v1/orders/{id}/pay 为 **dev stub** |
+
+**实测（临时实例 8012，COMMERCIAL=1）：**
+
+`
+1) 免费生成        → 命中缓存 200（0 额度、不计次）
+2) 付费买新照片    → ord_9bab034a… 4.9 CNY → pay → credits=1
+3) 用付费额度生成  → succeeded，locked=true，download_url=null
+4) 下单解锁该张    → ord_44ff9421… → pay → locked=false
+5) 下载无水印      → 200，2,091,696 bytes
+6) 无签名访问原图  → 403 file_url_denied
+`
+
+**接入真实支付时要改的地方**：POST /v1/orders/{id}/pay 换成「微信支付下单 + 回调验签」，回调里做 status=paid 与解锁；价格、订单有效期、预览保存期限在 config.commercial 里改。
+
+---
 ## 五、验证记录（本机实跑）
 
 ### 5.1 真实自拍（1080×1920，室内杂背景，有胡渣）

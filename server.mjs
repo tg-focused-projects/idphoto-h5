@@ -34,6 +34,7 @@ import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { toJpeg } from './lib/jpeg.mjs';
 import { makeCutout } from './lib/matte.mjs';
+import { makePreview } from './lib/watermark.mjs';
 import {
   MODES, SUITS, BGS, SIZES, DEFAULTS,
   normalizeParams, buildPrompt, buildRefinePrompt, describeParams,
@@ -81,6 +82,108 @@ const API_CFG = CONFIG.api || {};
 // 公网模式：整站对外（frp / 公网反代直接连本进程），所有 /api/*、/v1/* 都要 key。
 // 本地同源开发默认不开，H5 直接调不需要密钥。
 const PUBLIC_MODE = String(process.env.IDPHOTO_PUBLIC ?? (API_CFG.public ? '1' : '0')) === '1';
+/* ------------------------------------------------- 商业化：会话 / 额度 / 订单 */
+// 开关默认关闭（config.json → commercial.enabled，或环境变量 COMMERCIAL=1）。
+// 关闭时行为与之前完全一致：取图直接开放、无额度限制。
+const COMMERCIAL = {
+  enabled: String(process.env.COMMERCIAL ?? ((CONFIG.commercial || {}).enabled ? '1' : '0')) === '1',
+  price: Number((CONFIG.commercial || {}).price ?? 4.9),
+  currency: (CONFIG.commercial || {}).currency || 'CNY',
+  freePerWindow: Number((CONFIG.commercial || {}).freePerWindow ?? 1),
+  windowHours: Number((CONFIG.commercial || {}).windowHours ?? 24),
+  previewTtlHours: Number((CONFIG.commercial || {}).previewTtlHours ?? 24),
+  watermark: (CONFIG.commercial || {}).watermark || { text: '证件照预览 · 解锁后无水印', opacity: 0.1 },
+};
+
+const DATA_DIR = path.join(__dirname, 'data');
+const SESS_FILE = path.join(DATA_DIR, 'sessions.json');
+const ORDER_FILE = path.join(DATA_DIR, 'orders.json');
+const SIGN_SECRET = process.env.SIGN_SECRET || crypto.createHash('sha256').update('idphoto:' + c2aKey()).digest('hex');
+
+function loadJsonMap(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
+}
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const SESSIONS = loadJsonMap(SESS_FILE);
+const ORDERS = loadJsonMap(ORDER_FILE);
+let persistTimer = null;
+function persistCommercial() {
+  if (!COMMERCIAL.enabled) return;
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    try { fs.writeFileSync(SESS_FILE, JSON.stringify(SESSIONS)); } catch {}
+    try { fs.writeFileSync(ORDER_FILE, JSON.stringify(ORDERS)); } catch {}
+  }, 500);
+}
+
+function parseCookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+
+function sidOf(req, res) {
+  const c = parseCookies(req);
+  let sid = c.idp_sid;
+  if (!sid && res) {
+    sid = crypto.randomBytes(12).toString('hex');
+    res.setHeader('Set-Cookie', `idp_sid=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
+  }
+  if (sid && !SESSIONS[sid]) { SESSIONS[sid] = { createdAt: Date.now(), jobs: [], unlocked: [], credits: 0 }; persistCommercial(); }
+  return sid || null;
+}
+
+function sessOf(sid) {
+  if (!sid) return null;
+  if (!SESSIONS[sid]) SESSIONS[sid] = { createdAt: Date.now(), jobs: [], unlocked: [], credits: 0 };
+  const s = SESSIONS[sid];
+  s.jobs = s.jobs || []; s.unlocked = s.unlocked || []; s.credits = s.credits || 0;
+  return s;
+}
+
+function quotaOf(s) {
+  const win = COMMERCIAL.windowHours * 3600 * 1000;
+  const usedAt = Number(s.freeUsedAt || 0);
+  const remain = usedAt ? Math.max(0, usedAt + win - Date.now()) : 0;
+  return {
+    canFree: !usedAt || remain === 0,
+    usedAt: usedAt || null,
+    nextFreeAt: remain ? new Date(usedAt + win).toISOString() : null,
+    credits: s.credits,
+  };
+}
+
+function state_quota(s) {
+  if (!s) return null;
+  return quotaOf(s);
+}
+
+function signName(name, ttlSec = 3600) {
+  const exp = Math.floor(Date.now() / 1000) + ttlSec;
+  const sig = crypto.createHmac('sha256', SIGN_SECRET).update(`${name}|${exp}`).digest('hex').slice(0, 32);
+  return { exp, sig };
+}
+
+function fileUrl(base, name, ttlSec = 3600) {
+  if (!name) return null;
+  if (!COMMERCIAL.enabled) return `${base}/files/${name}`;
+  const { exp, sig } = signName(name, ttlSec);
+  return `${base}/files/${name}?exp=${exp}&sig=${sig}`;
+}
+
+function verifyFileSig(name, exp, sig) {
+  if (!COMMERCIAL.enabled) return true;
+  const e = Number(exp);
+  if (!e || !sig) return false;
+  if (e * 1000 < Date.now()) return false;
+  const want = crypto.createHmac('sha256', SIGN_SECRET).update(`${name}|${e}`).digest('hex').slice(0, 32);
+  try { return crypto.timingSafeEqual(Buffer.from(want), Buffer.from(String(sig))); } catch { return false; }
+}
+/* ------------------------------------------------------------------------ */
 const PER_MINUTE = Number(API_CFG.rateLimit?.perMinute ?? 6);
 const PER_DAY = Number(API_CFG.rateLimit?.perDay ?? 80);
 const POLL_PER_MINUTE = Number(API_CFG.rateLimit?.pollPerMinute ?? 120);
@@ -464,6 +567,29 @@ function jobView(id, req) {
     view.prompt = j.prompt;
   }
   if (j.status === 'succeeded') {
+    const sid = sidOf(req, null);
+    const s = sid ? sessOf(sid) : null;
+    const unlocked = !!(s && (s.unlocked || []).includes(id));
+    if (COMMERCIAL.enabled) {
+      const pv = j.result.preview;
+      const pvUrl = pv ? fileUrl(base, pv.name, COMMERCIAL.previewTtlHours * 3600) : null;
+      const origUrl = fileUrl(base, j.result.name, 900);
+      view.result = {
+        preview_url: pvUrl,
+        url: pvUrl,                                  // 未付费时 url 只给带水印的
+        bytes: pv ? pv.bytes : j.result.bytes,
+        locked: !unlocked,
+        download_url: unlocked ? origUrl : null,     // 付费后才给无水印原图
+        quota: state_quota(s),
+      };
+      if (j.result.jpeg) view.result.jpeg_url = unlocked ? fileUrl(base, j.result.jpeg.name, 900) : pvUrl;
+      if (j.result.cutout && unlocked) {
+        view.result.cutout_url = fileUrl(base, j.result.cutout.name, 900);
+        view.result.matte_url = fileUrl(base, j.result.matte.name, 900);
+        view.result.matte_bg = j.result.bg || null;
+      }
+      return view;
+    }
     view.result = {
       url: `${base}/files/${j.result.name}`,
       cached: !!j.result.cached,
@@ -538,6 +664,23 @@ async function runJob(id) {
 
     j.status = 'succeeded';
     j.result = out;
+    // 商业化：生成成功后才记额度（失败不扣），预览是派生件，失败也不影响主流程
+    try {
+      if (COMMERCIAL.enabled && j.sid) {
+        const s = sessOf(j.sid);
+        if (j.usedFree) s.freeUsedAt = Date.now();
+        else if (s.credits > 0) s.credits -= 1;
+        (s.jobs = s.jobs || []).push(id);
+        if (s.jobs.length > 50) s.jobs = s.jobs.slice(-50);
+        persistCommercial();
+      }
+      if (COMMERCIAL.enabled && j.result) {
+        const pv = await makePreview(path.join(OUT_DIR, j.result.name), COMMERCIAL.watermark);
+        if (pv) j.result.preview = pv;
+      }
+    } catch (e) {
+      console.warn('[idphoto] 商业化后处理失败:', e.message);
+    }
     j.finishedAt = Date.now();
   } catch (e) {
     j.status = 'failed';
@@ -572,7 +715,7 @@ function record(entry) {
 
 /* --------------------------------------------- 参数化提交（JSON / 二进制共用） */
 // 命中缓存放回 200+result；否则建任务返回 202。两条入参路径共用这一段，避免两边逻辑走样。
-function submitIdphotoAsync(req, res, params, image, model) {
+async function submitIdphotoAsync(req, res, params, image, model) {
   const prompt = params.refineOnly ? buildRefinePrompt(params) : buildPrompt(params);
   const mdl = model || CONFIG.gen?.model || 'gpt-image-2';
 
@@ -580,6 +723,39 @@ function submitIdphotoAsync(req, res, params, image, model) {
     const hit = cacheGet(cacheKey(image.buffer, { prompt, size: params.size, model: mdl }));
     if (hit) {
       const base = publicBase(req);
+      // 商业化：缓存命中也要走水印/签名，不能把原图裸给出去（也不占免费额度）
+      if (COMMERCIAL.enabled) {
+        let pv = hit.preview;
+        if (!pv) {
+          const made = await makePreview(path.join(OUT_DIR, hit.name), COMMERCIAL.watermark);
+          if (made) { pv = made; hit.preview = made; cacheSet(cacheKey(image.buffer, { prompt, size: params.size, model: mdl }), hit); }
+        }
+        const sid2 = sidOf(req, res);
+        const s2 = sessOf(sid2);
+        const unlocked2 = !!(s2 && (s2.unlocked || []).some((jid) => {
+          const jj = jobs.get(jid);
+          return jj && jj.result && jj.result.name === hit.name;
+        }));
+        return json(res, 200, {
+          ok: true,
+          cached: true,
+          status: 'succeeded',
+          params,
+          params_summary: describeParams(params),
+          prompt,
+          result: {
+            preview_url: pv ? fileUrl(base, pv.name, COMMERCIAL.previewTtlHours * 3600) : null,
+            url: pv ? fileUrl(base, pv.name, COMMERCIAL.previewTtlHours * 3600) : null,
+            cached: true,
+            locked: !unlocked2,
+            bytes: pv ? pv.bytes : hit.bytes,
+            jpeg_url: unlocked2 && hit.jpeg ? fileUrl(base, hit.jpeg.name, 900) : (pv ? fileUrl(base, pv.name, COMMERCIAL.previewTtlHours * 3600) : null),
+            jpeg_bytes: unlocked2 && hit.jpeg ? hit.jpeg.bytes : null,
+            download_url: unlocked2 ? fileUrl(base, hit.name, 900) : null,
+            quota: state_quota(s2),
+          },
+        }, corsHeaders(req));
+      }
       return json(res, 200, {
         ok: true,
         cached: true,
@@ -619,6 +795,37 @@ function submitIdphotoAsync(req, res, params, image, model) {
     inflight.delete(ck);
   }
 
+  // ── 商业化：会话额度 + 同会话单飞 ──
+  let sid = null;
+  let usedFree = false;
+  if (COMMERCIAL.enabled) {
+    sid = sidOf(req, res);
+    const s = sessOf(sid);
+    const runningId = (s.jobs || []).find((jid) => {
+      const jj = jobs.get(jid);
+      return jj && (jj.status === 'pending' || jj.status === 'running');
+    });
+    if (runningId) {
+      return json(res, 202, {
+        ok: true, job_id: runningId, status: 'pending', deduped: true, reason: 'session_running',
+        poll_url: `${publicBase(req)}/v1/jobs/${runningId}`,
+        params, params_summary: describeParams(params), prompt,
+      }, corsHeaders(req));
+    }
+    const q = quotaOf(s);
+    if (!q.canFree && q.credits <= 0) {
+      return fail(res, req, 402, {
+        error: '免费额度已用完，需要付费生成',
+        code: 'free_quota_exhausted',
+        quota: q,
+        price: { amount: COMMERCIAL.price, currency: COMMERCIAL.currency },
+        next_free_at: q.nextFreeAt,
+        hint: '购买：POST /v1/orders {"job_id":"..."} 解锁已有预览，或 {"type":"new_photo"} 付费新生成',
+      });
+    }
+    usedFree = q.canFree;
+  }
+
   const id = newJobId();
   if (ck) inflight.set(ck, id);
   const job = {
@@ -629,7 +836,9 @@ function submitIdphotoAsync(req, res, params, image, model) {
     refinePrompt: (!params.refineOnly && params.passes === 2) ? buildRefinePrompt(params) : null,
     size: params.size,
     model: mdl,
-      cutout: !!params.cutout,
+    cutout: !!params.cutout,
+    sid,
+    usedFree,
   };
   jobs.set(id, job);
   setImmediate(() => runJob(id));
@@ -872,6 +1081,59 @@ async function handleApi(req, res, url) {
   }
 
   // 异步任务：查询
+  // ── 订单（首版单张购买；支付为 dev stub，接真实支付时替换 pay 实现）──
+  if (req.method === 'POST' && (url === '/v1/orders' || url === '/api/orders')) {
+    if (!COMMERCIAL.enabled) return fail(res, req, 404, { error: '商业化未开启', code: 'commercial_disabled' });
+    let body;
+    try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) {
+      return fail(res, req, 400, { error: '请求体不是合法 JSON：' + e.message, code: 'bad_json' });
+    }
+    const sid = sidOf(req, res);
+    const s = sessOf(sid);
+    const jobId = body.job_id ? String(body.job_id) : null;
+    const type = body.type === 'new_photo' ? 'new_photo' : 'unlock';
+    if (type === 'unlock' && (!jobId || !jobs.get(jobId))) {
+      return fail(res, req, 400, { error: 'job_id 不存在或已过期', code: 'job_not_found' });
+    }
+    const id = 'ord_' + crypto.randomBytes(8).toString('hex');
+    ORDERS[id] = {
+      id, sid, type, job_id: jobId, status: 'pending',
+      amount: COMMERCIAL.price, currency: COMMERCIAL.currency,
+      createdAt: Date.now(),
+    };
+    persistCommercial();
+    return json(res, 201, {
+      ok: true, order_id: id, status: 'pending',
+      amount: COMMERCIAL.price, currency: COMMERCIAL.currency,
+      job_id: jobId, type,
+      pay_url: `${publicBase(req)}/v1/orders/${id}/pay`,
+      note: 'pay 目前是 dev stub，接入微信支付后替换为下单 + 回调验签',
+    }, corsHeaders(req));
+  }
+
+  const om = /^\/v1\/orders\/([A-Za-z0-9_]+)(\/pay)?$/.exec(url);
+  if (om) {
+    if (!COMMERCIAL.enabled) return fail(res, req, 404, { error: '商业化未开启', code: 'commercial_disabled' });
+    const ord = ORDERS[om[1]];
+    if (!ord) return fail(res, req, 404, { error: '订单不存在', code: 'order_not_found' });
+    if (req.method === 'GET' && !om[2]) {
+      return json(res, 200, { ok: true, ...ord }, corsHeaders(req));
+    }
+    if (req.method === 'POST' && om[2]) {
+      if (ord.status === 'paid') return json(res, 200, { ok: true, ...ord }, corsHeaders(req));
+      ord.status = 'paid';
+      ord.paidAt = Date.now();
+      const s = sessOf(ord.sid);
+      if (ord.type === 'unlock') {
+        (s.unlocked = s.unlocked || []).push(ord.job_id);
+      } else {
+        s.credits = (s.credits || 0) + 1;
+      }
+      persistCommercial();
+      return json(res, 200, { ok: true, ...ord, quota: state_quota(s) }, corsHeaders(req));
+    }
+  }
+
   const jm = /^\/(?:v1|api)\/jobs\/([A-Za-z0-9_]+)$/.exec(url);
   if (req.method === 'GET' && jm) {
     // 长轮询：?wait=20 → 最多挂 20 秒，直到任务变成终态才返回；客户端不用自己 sleep 轮询
@@ -906,6 +1168,13 @@ async function serveStatic(req, res, url) {
   if (p === '/health') return json(res, 200, { ok: true });
 
   let file;
+  if (p.startsWith('/files/') && COMMERCIAL.enabled) {
+    const name = path.basename(p);
+    const qs2 = new URL(req.url || '/', 'http://x').searchParams;
+    if (!verifyFileSig(name, qs2.get('exp'), qs2.get('sig'))) {
+      return json(res, 403, { ok: false, code: 'file_url_denied', error: '取图链接无效或已过期（商业化模式需要签名 URL）' });
+    }
+  }
   if (p.startsWith('/files/') || p.startsWith('/outputs/')) {
     file = path.join(OUT_DIR, path.basename(p));
     if (!path.resolve(file).startsWith(path.resolve(OUT_DIR))) return json(res, 403, { ok: false, error: 'forbidden' });
@@ -950,6 +1219,7 @@ const server = http.createServer(async (req, res) => {
     || url === '/api/options' || url === '/v1/options' || url === '/api/requests'
     || url === '/api/idphoto' || url === '/v1/idphoto'
     || url === '/api/idphoto/raw' || url === '/v1/idphoto/raw'
+    || url.startsWith('/v1/orders') || url.startsWith('/api/orders')
     || url.startsWith('/api/generate') || url.startsWith('/v1/jobs') || url.startsWith('/api/jobs');
 
   if (isApi) {

@@ -25,3 +25,4 @@ watch.log
 outputs/.cache.json
 .watchdog.lock
 .watchdog.heartbeat
+data/
