@@ -1,72 +1,97 @@
-﻿/**
- * 鍏綉 API 瀹㈡埛绔ず渚嬶紙Node 20+锛岄浂渚濊禆锛? * ============================================================
- *   node tools/public_api_client.mjs <鐓х墖> <鍏綉baseURL> <apiKey> [prompt]
+/**
+ * 公网 API 客户端（推荐写法）
+ * ============================================================
+ *   node tools/public_api_client.mjs <照片> <baseURL> <apiKey> [prompt]
  *
- * 榛樿璧?*鍙傛暟鍖栨帴鍙?*锛堟帹鑽愶級锛氬墠绔彧浼犻€夐」锛屾彁绀鸿瘝鐢卞悗绔嫾銆? *   POST {base}/v1/idphoto  { image, params:{ mode, suit, bg, cleanShave, tidyHair, size, passes } }
- *   GET  {base}/v1/jobs/{id}
- *   GET  {base}/files/{name}
+ * 推荐链路（比 JSON + 定时轮询快、也省流量）：
+ *   1) POST /v1/idphoto/raw?...     body 直接是图片字节，省掉 base64 的 33%
+ *   2) GET  /v1/jobs/{id}?wait=25   长轮询，服务端挂住到任务终态才返回
+ *   3) GET  result.jpeg_url        取图（/files 不需要 key）
  *
- * 浼犱簡绗?4 涓弬鏁帮紙prompt锛夊垯鏀硅蛋鍘熷鎻愮ず璇嶆帴鍙?POST {base}/v1/jobs銆? * 涓轰粈涔堝紓姝ワ細鍗曞紶 40~90s锛屽叕缃戦暱杩炴帴瀹规槗琚腑闂磋澶囨帎鎺夈€? */
-
+ * 传了第 4 个参数（prompt）则走原始提示词接口 POST /v1/jobs（自定义提示词用）。
+ */
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 
 const [, , photoArg, baseArg, keyArg, promptArg] = process.argv;
 if (!photoArg || !baseArg || !keyArg) {
-  console.error('鐢ㄦ硶: node tools/public_api_client.mjs <鐓х墖> <鍏綉baseURL> <apiKey> [prompt]');
+  console.error('用法: node tools/public_api_client.mjs <照片> <baseURL> <apiKey> [prompt]');
   process.exit(2);
 }
 
-const base = baseArg.replace(/\/+$/, '');
-const dataUrl = 'data:image/jpeg;base64,' + fs.readFileSync(photoArg).toString('base64');
-console.log(`鐓х墖 ${path.basename(photoArg)}  payload ${(dataUrl.length / 1024 / 1024).toFixed(2)}MB`);
+const base = new URL(baseArg);
+const body = fs.readFileSync(photoArg);
+const t0 = performance.now();
 
-const auth = { Authorization: `Bearer ${keyArg}`, 'Content-Type': 'application/json' };
-const t0 = Date.now();
-
-// 1) 鎻愪氦锛氭湁 prompt 璧板師濮嬫帴鍙ｏ紝娌℃湁灏辫蛋鍙傛暟鍖栨帴鍙?const useRaw = !!promptArg;
-const submitBody = useRaw
-  ? { image: dataUrl, prompt: promptArg, size: '1024x1536' }
-  : { image: dataUrl, params: { mode: 'suit', suit: 'black-suit', bg: '438edb', cleanShave: true, tidyHair: false, size: '1024x1536', passes: 1 } };
-
-const submit = await fetch(`${base}${useRaw ? '/v1/jobs' : '/v1/idphoto'}`, {
-  method: 'POST', headers: auth, body: JSON.stringify(submitBody),
-});
-const job = await submit.json();
-console.log(`submit ${submit.status}  ${useRaw ? '(鍘熷 prompt)' : '(鍙傛暟鍖?'}`);
-if (job.params_summary) console.log('  params:', job.params_summary);
-if (job.prompt) console.log('  prompt:', job.prompt);
-if (!job.ok) { console.error(JSON.stringify(job)); process.exit(1); }
-
-// 2) 杞
-let view = null;
-for (let i = 0; i < 200; i++) {
-  await new Promise((r) => setTimeout(r, 1000));
-  const r = await fetch(`${base}/v1/jobs/${job.job_id}`, { headers: { Authorization: `Bearer ${keyArg}` } });
-  view = await r.json();
-  const s = ((Date.now() - t0) / 1000).toFixed(0);
-  process.stdout.write(`\r  [${s}s] ${view.status}          `);
-  if (view.status === 'succeeded' || view.status === 'failed') break;
+function call(method, pathname, payload, headers = {}) {
+  return new Promise((resolve) => {
+    const h = { Authorization: 'Bearer ' + keyArg, ...headers };
+    if (payload) h['Content-Length'] = payload.length;
+    const req = http.request({ host: base.hostname, port: base.port || 80, path: pathname, method, headers: h, timeout: 400000 }, (res) => {
+      let d = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => (d += c));
+      res.on('end', () => {
+        let j = null;
+        try { j = JSON.parse(d); } catch {}
+        resolve({ status: res.statusCode, json: j, raw: d });
+      });
+    });
+    req.on('error', (e) => resolve({ status: 0, raw: e.message }));
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    if (payload) req.write(payload);
+    req.end();
+  });
 }
-console.log('');
 
-if (view?.status !== 'succeeded') {
-  console.error('澶辫触:', JSON.stringify(view));
+let jobId = null;
+
+if (promptArg) {
+  // 原始提示词：仍走 JSON（要带 prompt）
+  const payload = Buffer.from(JSON.stringify({ image: 'data:image/jpeg;base64,' + body.toString('base64'), prompt: promptArg, size: '1024x1536' }));
+  const r = await call('POST', '/v1/jobs', payload, { 'Content-Type': 'application/json' });
+  if (r.status !== 202) { console.error('submit 失败', r.status, String(r.raw).slice(0, 200)); process.exit(1); }
+  jobId = r.json.job_id;
+  console.log(`submit(JSON+prompt) 202  job=${jobId}`);
+} else {
+  const qs = new URLSearchParams({ mode: 'suit', suit: 'black-suit', bg: '438edb', size: '295x413', cleanShave: '1' });
+  const r = await call('POST', `/v1/idphoto/raw?${qs}`, body, { 'Content-Type': 'image/jpeg' });
+  if (r.status === 200 && r.json?.cached) {
+    console.log(`命中缓存 ${((performance.now() - t0) / 1000).toFixed(2)}s  0 额度`);
+    console.log('  ', r.json.result.jpeg_url);
+    process.exit(0);
+  }
+  if (r.status !== 202) { console.error('submit 失败', r.status, String(r.raw).slice(0, 200)); process.exit(1); }
+  jobId = r.json.job_id;
+  console.log(`submit(RAW ${(body.length / 1024).toFixed(0)}KB) 202  job=${jobId}  ${((performance.now() - t0) / 1000).toFixed(2)}s`);
+}
+
+let view = null;
+let waits = 0;
+while (performance.now() - t0 < 420000) {
+  const r = await call('GET', `/v1/jobs/${jobId}?wait=25`);
+  waits++;
+  view = r.json;
+  if (view && (view.status === 'succeeded' || view.status === 'failed')) break;
+}
+
+if (!view || view.status !== 'succeeded') {
+  console.error('失败:', JSON.stringify(view)?.slice(0, 300));
   process.exit(1);
 }
 
-// 3) 鍙栧浘锛氫紭鍏堟嬁 jpeg锛堝叕缃戝甫瀹藉樊 10 鍊嶏級锛屾病鏈夊氨閫€鍥?png
-const pick = view.result.jpeg_url || view.result.url;
-const img = await fetch(pick);
-const buf = Buffer.from(await img.arrayBuffer());
-const ext = pick.endsWith('.jpg') ? '.jpg' : '.png';
-const out = path.join(process.cwd(), 'out', `public-api-${Date.now()}${ext}`);
+const url = view.result.jpeg_url || view.result.url;
+const buf = await new Promise((resolve) => {
+  http.get(url, (res) => {
+    const chunks = [];
+    res.on('data', (c) => chunks.push(c));
+    res.on('end', () => resolve(Buffer.concat(chunks)));
+  }).on('error', () => resolve(Buffer.alloc(0)));
+});
+const out = path.join(process.cwd(), 'out', `public-api-${Date.now()}${url.endsWith('.jpg') ? '.jpg' : '.png'}`);
 fs.mkdirSync(path.dirname(out), { recursive: true });
 fs.writeFileSync(out, buf);
 
-console.log(`缁撴灉 png: ${view.result.url}  (${(view.result.bytes / 1024).toFixed(0)}KB)`);
-if (view.result.jpeg_url) {
-  console.log(`缁撴灉 jpg: ${view.result.jpeg_url}  (${(view.result.jpeg_bytes / 1024).toFixed(0)}KB)`);
-}
-console.log(`钀界洏 ${out}  ${buf.length}B  鎬昏€楁椂 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-
+console.log(`长轮询 ${waits} 次，服务端生成 ${(view.elapsed_ms / 1000).toFixed(1)}s`);
+console.log(`总耗时 ${((performance.now() - t0) / 1000).toFixed(1)}s  →  ${out}  ${(buf.length / 1024).toFixed(0)}KB`);

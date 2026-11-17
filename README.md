@@ -76,6 +76,9 @@ h5/
 │  ├─ diagnose.mjs           五段链路连通性诊断（报 502/401 时先跑它）
 │  ├─ repro_conn_reset.mjs   复现 keep-alive 陈旧连接导致的 ECONNRESET
 │  ├─ watchdog.mjs           守护：30s 一轮保证 8000 + frpc 一直活着
+│  ├─ bench_public.mjs       耗时拆解：upload（不耗额度）/ gen（四段计时）
+│  ├─ bench_longpoll.mjs     RAW + 长轮询 端到端计时
+│  ├─ probe_size.mjs         探测上游对某个 size 的真实出图与耗时
 │  ├─ cdp_test.mjs           无头 Chrome(CDP) 跑完整 UI 链路
 │  ├─ probe_layout.mjs       量视口/grid 轨道，排查横向溢出
 │  └─ shot_mobile.mjs        390×844@2x 手机视口截图
@@ -188,7 +191,7 @@ node tools/make_suit_previews.mjs      # 文生图，5 张 = 5 次额度
 | GET | `/v1/options` | 可选值：modes / suits / bgs / sizes / defaults |
 | POST | `/v1/idphoto` | **参数化提交**，`202 {job_id, poll_url, params, params_summary, prompt}` |
 | POST | `/api/idphoto` | 参数化同步版（本机 H5 用，公网模式下也要 key） |
-| GET | `/v1/jobs/{id}` | 任务状态；结构化任务回显 `params` / `params_summary` / `prompt` |
+| POST | `/v1/idphoto/raw` | **二进制直传**：body 就是图片字节，参数走 query（省掉 base64 的 33%） |`r`n| GET | `/v1/jobs/{id}?wait=25` | 任务状态；带 `wait` 时**长轮询**，任务终态才返回（客户端不用 sleep） |
 | GET | `/files/{name}` | 取图（`result.url` PNG / `result.jpeg_url` 压缩版，**不需要 key**） |
 | GET | `/api/health` | 后端在线 + 号池额度 + 限流档位 |
 | POST | `/v1/jobs` | 原始 prompt 版（要完全自定义提示词时用） |
@@ -473,6 +476,20 @@ c2a 调用日志（同一时段）
 | 优先 jpeg_url | 下载 2.9s → 0.3s |
 | 首图压缩（H5 端 1280px） | 828KB body → 160KB，提交 962ms → 78ms |
 
+#### 本轮新增的优化（已上线）
+
+| 优化 | 实测 |
+|---|---|
+| **二进制直传** POST /v1/idphoto/raw | body 120KB vs JSON 160KB（−25%）；620KB 图省 828→620KB |
+| **长轮询** GET /v1/jobs/{id}?wait=25 | 发现延迟 140~635ms → **99ms**；请求数从 ~40 次降到 2 次 |
+| **并发去重** | 同一图同参数在生成中重复提交 → 返回同一个 job_id + deduped:true，2ms，**不重复烧额度** |
+| 缓存 + RAW + 长轮询 组合 | 121ms 出结果，0 额度 |
+
+一次完整的 RAW + 长轮询实测（46KB 图）：
+
+`
+提交 53ms → 生成 38.5s → 长轮询 2 次(25s/次) → 发现延迟 99ms → 下载 61ms → 总 38.6s
+`
 **还能再快的地方（按收益排序）**
 
 1. **客户端把图压到长边 ≤1280、JPEG q90**：能把上传从 1s 压到 80ms，比 gzip 更彻底。

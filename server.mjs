@@ -385,6 +385,8 @@ async function callImageApi({ image, prompt, size, model }) {
 
 /* ------------------------------------------------------------ 任务队列 */
 const jobs = new Map();
+// 同一个 key 正在生成时，重复提交直接返回同一个 job（防止前端重试/双击白烧额度）
+const inflight = new Map();
 
 function newJobId() {
   return 'job_' + crypto.randomBytes(9).toString('hex');
@@ -485,6 +487,7 @@ async function runJob(id) {
     j.finishedAt = Date.now();
   } finally {
     delete j.image; // 不长期持有参考图
+    if (j.ck) inflight.delete(j.ck);
   }
 }
 
@@ -506,6 +509,76 @@ function record(entry) {
   } catch {}
 }
 
+/* --------------------------------------------- 参数化提交（JSON / 二进制共用） */
+// 命中缓存放回 200+result；否则建任务返回 202。两条入参路径共用这一段，避免两边逻辑走样。
+function submitIdphotoAsync(req, res, params, image, model) {
+  const prompt = params.refineOnly ? buildRefinePrompt(params) : buildPrompt(params);
+  const mdl = model || CONFIG.gen?.model || 'gpt-image-2';
+
+  if (image.buffer) {
+    const hit = cacheGet(cacheKey(image.buffer, { prompt, size: params.size, model: mdl }));
+    if (hit) {
+      const base = publicBase(req);
+      return json(res, 200, {
+        ok: true,
+        cached: true,
+        status: 'succeeded',
+        params,
+        params_summary: describeParams(params),
+        prompt,
+        result: {
+          url: `${base}/files/${hit.name}`,
+          cached: true,
+          bytes: hit.bytes,
+          jpeg_url: hit.jpeg ? `${base}/files/${hit.jpeg.name}` : null,
+          jpeg_bytes: hit.jpeg?.bytes ?? null,
+        },
+      }, corsHeaders(req));
+    }
+  }
+
+  const ck = image.buffer ? cacheKey(image.buffer, { prompt, size: params.size, model: mdl }) : null;
+  if (ck && inflight.has(ck)) {
+    const running = inflight.get(ck);
+    const view = jobView(running, req);
+    if (view) {
+      return json(res, 202, {
+        ok: true, job_id: running, status: view.status, deduped: true,
+        poll_url: `${publicBase(req)}/v1/jobs/${running}`,
+        retry_after_ms: 2000,
+        params, params_summary: describeParams(params), prompt,
+      }, corsHeaders(req));
+    }
+    inflight.delete(ck);
+  }
+
+  const id = newJobId();
+  if (ck) inflight.set(ck, id);
+  const job = {
+    status: 'pending', createdAt: Date.now(), startedAt: 0, finishedAt: 0,
+    ck,
+    image, prompt, params, paramsSummary: describeParams(params), trace: String(res.getHeader('X-Trace-Id') || ''),
+    passes: params.refineOnly ? 1 : params.passes,
+    refinePrompt: (!params.refineOnly && params.passes === 2) ? buildRefinePrompt(params) : null,
+    size: params.size,
+    model: mdl,
+  };
+  jobs.set(id, job);
+  setImmediate(() => runJob(id));
+
+  return json(res, 202, {
+    ok: true,
+    job_id: id,
+    status: 'pending',
+    poll_url: `${publicBase(req)}/v1/jobs/${id}`,
+    retry_after_ms: 3000,
+    params,
+    params_summary: job.paramsSummary,
+    prompt,
+    ...(job.refinePrompt ? { refine_prompt: job.refinePrompt } : {}),
+  }, corsHeaders(req));
+}
+
 /* -------------------------------------------------------------- 路由 */
 async function handleApi(req, res, url) {
   // /api/config 是给前端渲染用的非敏感配置（不含 key），公网模式下也放行
@@ -514,7 +587,8 @@ async function handleApi(req, res, url) {
   }
 
   const isGen = req.method === 'POST' && (url === '/api/generate' || url === '/api/idphoto'
-    || url === '/v1/jobs' || url === '/api/jobs' || url === '/v1/idphoto');
+    || url === '/v1/jobs' || url === '/api/jobs' || url === '/v1/idphoto'
+    || url === '/api/idphoto/raw' || url === '/v1/idphoto/raw');
   const g = guard(req, isGen ? 'gen' : 'poll');
   if (g) return json(res, g[0], g[1], corsHeaders(req));
 
@@ -661,56 +735,34 @@ async function handleApi(req, res, url) {
       return fail(res, req, 413, { error: '参考图超过 12MB', code: 'ref_too_large' });
     }
 
-    const params = norm.params;
-    const prompt = params.refineOnly ? buildRefinePrompt(params) : buildPrompt(params);
-    const mdl = body.model || CONFIG.gen?.model || 'gpt-image-2';
+    return submitIdphotoAsync(req, res, norm.params, image, body.model);
+  }
 
-    // 命中缓存：直接 200 + result，不用再给 job_id 让客户端轮询
-    if (image.buffer) {
-      const hit = cacheGet(cacheKey(image.buffer, { prompt, size: params.size, model: mdl }));
-      if (hit) {
-        const base = publicBase(req);
-        return json(res, 200, {
-          ok: true,
-          cached: true,
-          status: 'succeeded',
-          params,
-          params_summary: describeParams(params),
-          prompt,
-          result: {
-            url: `${base}/files/${hit.name}`,
-            cached: true,
-            bytes: hit.bytes,
-            jpeg_url: hit.jpeg ? `${base}/files/${hit.jpeg.name}` : null,
-            jpeg_bytes: hit.jpeg?.bytes ?? null,
-          },
-        }, corsHeaders(req));
-      }
+  // 二进制直传：body 就是图片字节（省掉 base64 的 33% 膨胀），参数走 query
+  //   POST /v1/idphoto/raw?mode=suit&suit=black-suit&bg=438edb&size=295x413&cleanShave=1
+  if (req.method === 'POST' && (url === '/v1/idphoto/raw' || url === '/api/idphoto/raw')) {
+    const qs = new URL(req.url, 'http://x').searchParams;
+    const raw = {};
+    for (const k of ['mode', 'suit', 'bg', 'size', 'extra', 'model']) {
+      if (qs.has(k)) raw[k] = qs.get(k);
     }
+    for (const k of ['cleanShave', 'tidyHair', 'refineOnly']) {
+      if (qs.has(k)) raw[k] = !/^(0|false|no)$/i.test(String(qs.get(k)));
+    }
+    if (qs.has('passes')) raw.passes = Number(qs.get('passes'));
 
-    const id = newJobId();
-    const job = {
-      status: 'pending', createdAt: Date.now(), startedAt: 0, finishedAt: 0,
-      image, prompt, params, paramsSummary: describeParams(params), trace: String(res.getHeader('X-Trace-Id') || ''),
-      passes: params.refineOnly ? 1 : params.passes,
-      refinePrompt: (!params.refineOnly && params.passes === 2) ? buildRefinePrompt(params) : null,
-      size: params.size,
-      model: mdl,
-    };
-    jobs.set(id, job);
-    setImmediate(() => runJob(id));
+    const norm = normalizeParams(raw);
+    if (!norm.ok) return fail(res, req, 400, { error: norm.error, code: 'bad_params' });
 
-    return json(res, 202, {
-      ok: true,
-      job_id: id,
-      status: 'pending',
-      poll_url: `${publicBase(req)}/v1/jobs/${id}`,
-      retry_after_ms: 3000,
-      params,
-      params_summary: job.paramsSummary,
-      prompt,
-      ...(job.refinePrompt ? { refine_prompt: job.refinePrompt } : {}),
-    }, corsHeaders(req));
+    let buf;
+    try { buf = await readBody(req); } catch (e) {
+      return fail(res, req, 400, { error: e.message, code: 'bad_body' });
+    }
+    if (!buf.length) return fail(res, req, 400, { error: '请求体为空，body 应该是图片字节', code: 'empty_body' });
+    if (buf.length > 12 * 1024 * 1024) return fail(res, req, 413, { error: '参考图超过 12MB', code: 'ref_too_large' });
+    const mime = String(req.headers['content-type'] || 'image/jpeg').split(';')[0].trim();
+
+    return submitIdphotoAsync(req, res, norm.params, { mime, buffer: buf }, raw.model);
   }
 
   // 异步任务：提交（原始 prompt 版，给需要完全自定义提示词的调用方）
@@ -750,8 +802,15 @@ async function handleApi(req, res, url) {
   // 异步任务：查询
   const jm = /^\/(?:v1|api)\/jobs\/([A-Za-z0-9_]+)$/.exec(url);
   if (req.method === 'GET' && jm) {
-    const view = jobView(jm[1], req);
+    // 长轮询：?wait=20 → 最多挂 20 秒，直到任务变成终态才返回；客户端不用自己 sleep 轮询
+    const waitSec = Math.min(30, Math.max(0, Number(new URL(req.url, 'http://x').searchParams.get('wait') || 0)));
+    const deadline = Date.now() + waitSec * 1000;
+    let view = jobView(jm[1], req);
     if (!view) return json(res, 404, { ok: false, error: 'job 不存在或已过期' }, corsHeaders(req));
+    while (waitSec > 0 && (view.status === 'pending' || view.status === 'running') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 200));
+      view = jobView(jm[1], req) || view;
+    }
     return json(res, 200, { ok: true, ...view }, corsHeaders(req));
   }
 
@@ -818,6 +877,7 @@ const server = http.createServer(async (req, res) => {
   const isApi = url === '/api/health' || url === '/api/status' || url === '/api/config'
     || url === '/api/options' || url === '/v1/options' || url === '/api/requests'
     || url === '/api/idphoto' || url === '/v1/idphoto'
+    || url === '/api/idphoto/raw' || url === '/v1/idphoto/raw'
     || url.startsWith('/api/generate') || url.startsWith('/v1/jobs') || url.startsWith('/api/jobs');
 
   if (isApi) {
