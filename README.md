@@ -524,6 +524,10 @@ node tools/bench_public.mjs gen    http://110.40.183.197:8000 <key> <照片> 102
 
 config.json → commercial.enabled 打开，或 COMMERCIAL=1 启动。**关闭时行为与之前完全一致。**
 
+> **当前状态（11-17）：联调模式已开启** —— `enabled=true` + `payStub=true`，公网 `110.40.183.197:8000` 生效。
+> `payStub=true` 意味着 `POST /v1/orders/{id}/pay` 直接置为已支付，**拿到 order_id 就能免费解锁**；
+> 接真实微信支付前必须把 `payStub` 改回 `false`（改回后该接口返回 `501 payment_not_configured`）。
+
 | 能力 | 实现 |
 |---|---|
 | 匿名会话 | Cookie idp_sid（HttpOnly，30 天），额度按会话记 |
