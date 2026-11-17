@@ -26,3 +26,6 @@ outputs/.cache.json
 .watchdog.lock
 .watchdog.heartbeat
 data/
+_*.log
+_*.err
+_ck.txt
