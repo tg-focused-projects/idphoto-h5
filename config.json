@@ -29,9 +29,9 @@
     }
   },
   "commercial": {
-    "_comment": "按张付费：默认关闭。开启后 /files/* 必须带签名 URL，未付费只能拿带水印预览。价格/有效期待产品确认。",
-    "enabled": false,
-    "payStub": false,
+    "_comment": "按张付费：当前为【前端联调模式】enabled=true + payStub=true。payStub 只用于联调，接真实微信支付前必须改回 false。",
+    "enabled": true,
+    "payStub": true,
     "price": 4.9,
     "currency": "CNY",
     "freePerWindow": 1,

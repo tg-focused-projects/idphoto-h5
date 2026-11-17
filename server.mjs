@@ -663,24 +663,31 @@ async function runJob(id) {
       out = refined;
     }
 
+    // 商业化：先派生带水印预览（失败不影响主流程），再翻状态——否则长轮询会先看到 succeeded 却拿不到 preview_url
+    if (COMMERCIAL.enabled) {
+      try {
+        const pv = await makePreview(path.join(OUT_DIR, out.name), COMMERCIAL.watermark);
+        if (pv) out.preview = pv;
+      } catch (e) {
+        console.warn('[idphoto] 水印预览生成失败:', e.message);
+      }
+    }
+
     j.status = 'succeeded';
     j.result = out;
-    // 商业化：生成成功后才记额度（失败不扣），预览是派生件，失败也不影响主流程
-    try {
-      if (COMMERCIAL.enabled && j.sid) {
+
+    // 记额度（只有生成成功才扣；失败不扣）
+    if (COMMERCIAL.enabled && j.sid) {
+      try {
         const s = sessOf(j.sid);
         if (j.usedFree) s.freeUsedAt = Date.now();
         else if (s.credits > 0) s.credits -= 1;
         (s.jobs = s.jobs || []).push(id);
         if (s.jobs.length > 50) s.jobs = s.jobs.slice(-50);
         persistCommercial();
+      } catch (e) {
+        console.warn('[idphoto] 额度记账失败:', e.message);
       }
-      if (COMMERCIAL.enabled && j.result) {
-        const pv = await makePreview(path.join(OUT_DIR, j.result.name), COMMERCIAL.watermark);
-        if (pv) j.result.preview = pv;
-      }
-    } catch (e) {
-      console.warn('[idphoto] 商业化后处理失败:', e.message);
     }
     j.finishedAt = Date.now();
   } catch (e) {
@@ -923,7 +930,36 @@ async function handleApi(req, res, url) {
     }
     const t0 = Date.now();
     try {
-      const out = await callImageApi({ image, prompt, size: body.size, model: body.model });
+      const out = await callImageApi({ image, prompt, size: body.size, model: body.model, cutout: !!norm.params?.cutout });
+      // 商业化开启时，同步接口也只给带水印预览 + 签名 URL（原图要付费解锁）
+      if (COMMERCIAL.enabled) {
+        let pv = out.preview;
+        if (!pv) {
+          pv = await makePreview(path.join(OUT_DIR, out.name), COMMERCIAL.watermark);
+          if (pv) out.preview = pv;
+        }
+        const base = publicBase(req);
+        const sidS = sidOf(req, res);
+        const sS = sessOf(sidS);
+        const unlockedS = !!(sS && (sS.unlocked || []).some((jid) => {
+          const jj = jobs.get(jid);
+          return jj && jj.result && jj.result.name === out.name;
+        }));
+        return json(res, 200, {
+          ok: true,
+          preview_url: pv ? fileUrl(base, pv.name, COMMERCIAL.previewTtlHours * 3600) : null,
+          url: pv ? fileUrl(base, pv.name, COMMERCIAL.previewTtlHours * 3600) : null,
+          cached: !!out.cached,
+          locked: !unlockedS,
+          bytes: pv ? pv.bytes : out.bytes,
+          jpeg_url: unlockedS && out.jpeg ? fileUrl(base, out.jpeg.name, 900) : (pv ? fileUrl(base, pv.name, COMMERCIAL.previewTtlHours * 3600) : null),
+          jpeg_bytes: unlockedS && out.jpeg ? out.jpeg.bytes : null,
+          download_url: unlockedS ? fileUrl(base, out.name, 900) : null,
+          quota: state_quota(sS),
+          elapsed_ms: Date.now() - t0,
+          model: body.model || 'gpt-image-2',
+        }, corsHeaders(req));
+      }
       return json(res, 200, {
         ok: true,
         url: '/files/' + out.name,
