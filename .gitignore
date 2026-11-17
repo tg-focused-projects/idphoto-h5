@@ -23,3 +23,5 @@ watchdog.out.log
 watchdog.err.log
 watch.log
 outputs/.cache.json
+.watchdog.lock
+.watchdog.heartbeat

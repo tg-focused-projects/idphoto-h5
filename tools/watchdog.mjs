@@ -24,6 +24,8 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LOG = path.join(ROOT, 'watchdog.log');
+const LOCK = path.join(ROOT, '.watchdog.lock');
+const HEARTBEAT = path.join(ROOT, '.watchdog.heartbeat');
 const INTERVAL_MS = Number(process.env.WATCH_INTERVAL_MS || 30_000);
 const LOCAL_PORT = 8000;
 const PUBLIC_URL = process.env.PUBLIC_BASE || 'http://110.40.183.197:8000';
@@ -166,8 +168,20 @@ async function tick() {
   if (acts.length) log(acts.join('; '));
 }
 
-log(`watchdog start  root=${ROOT}  interval=${INTERVAL_MS}ms  public=${PUBLIC_URL}`);
+// 单实例：抢不到锁就直接退出，避免多个 watchdog 互相打架
+let lockFd = null;
+try {
+  lockFd = fs.openSync(LOCK, 'w');
+} catch {
+  try { fs.unlinkSync(LOCK); lockFd = fs.openSync(LOCK, 'w'); } catch { process.exit(0); }
+}
+process.on('exit', () => { try { fs.closeSync(lockFd); fs.unlinkSync(LOCK); } catch {} });
+
+log(`watchdog start  pid=${process.pid}  root=${ROOT}  interval=${INTERVAL_MS}ms  public=${PUBLIC_URL}`);
 for (;;) {
-  try { await tick(); } catch (e) { log('tick error: ' + String(e?.message || e)); }
+  try {
+    await tick();
+    fs.writeFileSync(HEARTBEAT, `${new Date().toISOString()} pid=${process.pid}\n`);
+  } catch (e) { log('tick error: ' + String(e?.message || e)); }
   await sleep(INTERVAL_MS);
 }

@@ -417,6 +417,19 @@ ode server.mjs 和 rpc 都不在了（server.log 最后一条 00:21:41，
 > 为什么守护用 node 不用 PowerShell：PS 5.1 读 .ps1 按 ANSI 解码，**含中文的脚本必须存成 UTF-8 with BOM**，
 > 否则中文串会被截断导致解析错误；scripts/*.ps1 现在都是带 BOM 的。守护逻辑干脆用 node 写，行为稳定。
 
+**第二次事故（11-17 14:35 → 16:49 挂了 2 小时）**：这次连守护进程一起没了。
+原因是 watchdog 是用 Start-Process 从会话里起的，**它是会话进程树的孩子**，DSH 一重启就被一并收走。
+
+修复：
+
+| 措施 | 说明 |
+|---|---|
+| 用 **WMI 拉起** watchdogs | Invoke-CimMethod Win32_Process Create，父进程变成 WmiPrvSE.exe，脱离会话进程树，会话重启不再牵连 |
+| **心跳文件** .watchdog.heartbeat | 每 30s 覆盖写入时间戳，Get-Item .watchdog.heartbeat 就能判断守护是否还活着（watchdog.log 只在有动作时写，看不出存活） |
+| **单实例锁** .watchdog.lock | 防止多次拉起后互相打架（两个 watchdog 抢着重启会打架） |
+| 「启动」文件夹的 vbs | 兜底：登录后重新拉起 |
+
+实测：手动杀掉 :8000 后 **11 秒**自愈（watchdog.log 记录 started server:8000）。
 **人工体检**：
 
 `powershell
