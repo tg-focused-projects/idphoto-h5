@@ -30,6 +30,9 @@ const INTERVAL_MS = Number(process.env.WATCH_INTERVAL_MS || 30_000);
 const LOCAL_PORT = 8000;
 const PUBLIC_URL = process.env.PUBLIC_BASE || 'http://110.40.183.197:8000';
 const C2A_KEY_FILE = path.join(process.env.USERPROFILE || 'C:\\Users\\Administrator', '.dsh', 'chatgpt2api-native', 'admin-key');
+// 生图后端（chatgpt2api）也跟着会话一起死过，一起看住
+const C2A_PORT = Number(process.env.C2A_PORT || 38650);
+const C2A_HOME = path.join(process.env.USERPROFILE || 'C:\\Users\\Administrator', '.dsh', 'chatgpt2api-native');
 const FRPC_CANDIDATES = [
   'D:\\Qwen-Image-Edit-2511\\tools\\frp\\frp_0.70.1_windows_amd64\\frpc.exe',
   'C:\\DSH\\tools\\frp\\frpc.exe',
@@ -117,7 +120,20 @@ function killFrpc() {
   try { execFileSync('taskkill', ['/IM', 'frpc.exe', '/F'], { timeout: 8000 }); } catch {}
 }
 
+function startC2a() {
+  const py = path.join(C2A_HOME, 'source', '.venv', 'Scripts', 'python.exe');
+  if (!fs.existsSync(py)) return false;
+  let key = '';
+  try { key = fs.readFileSync(path.join(C2A_HOME, 'admin-key'), 'utf8').trim(); } catch {}
+  spawnDetached(py, ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', String(C2A_PORT), '--no-access-log'], {
+    cwd: path.join(C2A_HOME, 'source'),
+    env: { ...process.env, CHATGPT2API_AUTH_KEY: key, STORAGE_BACKEND: 'sqlite' },
+  });
+  return true;
+}
+
 let lastRestart = 0;
+let c2aMisses = 0;
 const cooldownOk = () => Date.now() - lastRestart > 45_000;
 
 async function tick() {
@@ -148,6 +164,21 @@ async function tick() {
   if (!frpcRunning()) {
     acts.push(startFrpc() ? 'started frpc' : 'FAILED start frpc (bin/token missing)');
     await sleep(4000);
+  }
+
+  // 3.5) 生图后端（c2a）——连续两轮没监听才拉起，避免和宿主自己的重启打架
+  if (!(await tcpOpen(C2A_PORT))) {
+    c2aMisses += 1;
+    if (c2aMisses >= 2 && cooldownOk()) {
+      const started = startC2a();
+      await sleep(8000);
+      const up = await tcpOpen(C2A_PORT);
+      acts.push(`${started ? 'started' : 'FAILED to start'} c2a:${C2A_PORT} -> ${up ? 'up' : 'still down'}`);
+      lastRestart = Date.now();
+      c2aMisses = 0;
+    }
+  } else {
+    c2aMisses = 0;
   }
 
   // 4) 公网体检

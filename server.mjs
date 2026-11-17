@@ -328,19 +328,36 @@ async function callImageApi({ image, prompt, size, model }) {
     images: [{ b64_json: img.buffer.toString('base64'), mime_type: img.mime, filename: 'reference-1.jpg' }],
   };
 
-  let r;
-  try {
-    r = await fetch(`${C2A_BASE}/v1/images/edits`, {
-      method: 'POST',
-      headers: { Authorization: 'Bearer ' + k, 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(GEN_TIMEOUT_MS),
-    });
-  } catch (e) {
-    const timeout = /timeout|abort/i.test(String(e.message || e));
-    throw upstreamError(timeout ? 'upstream_timeout' : 'upstream_unreachable',
-      timeout ? `生图超时（${Math.round(GEN_TIMEOUT_MS / 1000)}s）` : '生图后端不可达',
-      { detail: String(e.message || e) });
+  // 连接级失败（后端刚重启/端口未监听）重试几次：这台机器上 c2a 会随宿主会话重启，
+  // 5ms 就失败的任务几乎都是这一种，不值得让用户重新点一遍。
+  const body = JSON.stringify(payload);
+  let r = null;
+  let lastErr = null;
+  const delays = [1000, 3000, 6000, 10000];   // 合计约 20s，覆盖宿主重启 c2a 的窗口
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    try {
+      r = await fetch(`${C2A_BASE}/v1/images/edits`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + k, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body,
+        signal: AbortSignal.timeout(GEN_TIMEOUT_MS),
+      });
+      break;
+    } catch (e) {
+      lastErr = e;
+      const timeout = /timeout|abort/i.test(String(e.message || e));
+      const causeCode = String(e?.cause?.code || e?.code || '');
+      const retryable = !timeout && /ECONNREFUSED|ECONNRESET|EPIPE|EHOSTUNREACH|ENETUNREACH|UND_ERR_SOCKET|fetch failed/i.test(String(e.message || e) + ' ' + causeCode);
+      if (timeout || !retryable || attempt === delays.length) {
+        throw upstreamError(timeout ? 'upstream_timeout' : 'upstream_unreachable',
+          timeout ? `生图超时（${Math.round(GEN_TIMEOUT_MS / 1000)}s）` : `生图后端不可达（${C2A_BASE}）`,
+          {
+            detail: `attempt=${attempt + 1} ${String(e.message || e)}${causeCode ? ' [' + causeCode + ']' : ''}`,
+            hint: 确认 chatgpt2api 后端在  监听；38650 无监听时守护会自动拉起（约 60s 内生效）,
+          });
+      }
+      await new Promise((res) => setTimeout(res, delays[attempt]));
+    }
   }
   const text = await r.text();
   let b = null;
@@ -430,7 +447,7 @@ function jobView(id, req) {
       view.result.refine_prompt = j.refinePrompt || null;
     }
   }
-  if (j.status === 'failed') view.error = { message: j.error, detail: j.errorDetail || null, hint: j.errorHint || null };
+  if (j.status === 'failed') view.error = { code: j.errorCode || null, message: j.error, detail: j.errorDetail || null, hint: j.errorHint || null };
   return view;
 }
 
@@ -482,6 +499,7 @@ async function runJob(id) {
   } catch (e) {
     j.status = 'failed';
     j.error = String(e.message || e);
+    j.errorCode = e.code || null;
     j.errorDetail = e.detail || null;
     j.errorHint = e.hint || null;
     j.finishedAt = Date.now();
