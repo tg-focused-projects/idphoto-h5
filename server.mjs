@@ -33,6 +33,7 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { toJpeg } from './lib/jpeg.mjs';
+import { makeCutout } from './lib/matte.mjs';
 import {
   MODES, SUITS, BGS, SIZES, DEFAULTS,
   normalizeParams, buildPrompt, buildRefinePrompt, describeParams,
@@ -277,13 +278,20 @@ function cacheGet(key) {
   const jpeg = e.jpegName && fs.existsSync(path.join(OUT_DIR, e.jpegName))
     ? { name: e.jpegName, bytes: e.jpegBytes }
     : null;
-  return { name: e.name, bytes: e.bytes, jpeg, cached: true };
+  const have = (n) => n && fs.existsSync(path.join(OUT_DIR, n));
+  const cutout = have(e.cutoutName) ? { name: e.cutoutName, bytes: e.cutoutBytes } : null;
+  const matte = have(e.matteName) ? { name: e.matteName, bytes: e.matteBytes } : null;
+  return { name: e.name, bytes: e.bytes, jpeg, cutout, matte, bg: e.bg || null, subjectRatio: e.subjectRatio ?? null, cached: true };
 }
 
 function cacheSet(key, res) {
   CACHE[key] = {
     name: res.name, bytes: res.bytes,
     jpegName: res.jpeg?.name || null, jpegBytes: res.jpeg?.bytes || null,
+    cutoutName: res.cutout?.name || null, cutoutBytes: res.cutout?.bytes || null,
+    matteName: res.matte?.name || null, matteBytes: res.matte?.bytes || null,
+    bg: res.bg || null,
+    subjectRatio: res.subjectRatio ?? null,
     ts: Date.now(),
   };
   try {
@@ -294,7 +302,7 @@ function cacheSet(key, res) {
   } catch {}
 }
 
-async function callImageApi({ image, prompt, size, model }) {
+async function callImageApi({ image, prompt, size, model, cutout = false }) {
   const k = c2aKey();
   if (!k) throw upstreamError('backend_key_missing', '读不到 chatgpt2api admin-key（先启动一次 DSH）');
 
@@ -317,7 +325,20 @@ async function callImageApi({ image, prompt, size, model }) {
   const mdl = model || 'gpt-image-2';
   const ck = cacheKey(img.buffer, { prompt, size, model: mdl });
   const hit = cacheGet(ck);
-  if (hit) return hit;
+  if (hit) {
+    // 缓存里有成片但没有 cutout（上次没要）：就地派生，不再消耗额度
+    if (cutout && !hit.cutout) {
+      const cut = await makeCutout(path.join(OUT_DIR, hit.name));
+      if (cut) {
+        hit.cutout = cut.cutout;
+        hit.matte = cut.matte;
+        hit.bg = cut.bg;
+        hit.subjectRatio = cut.subjectRatio;
+        cacheSet(ck, hit);
+      }
+    }
+    return hit;
+  }
 
   const payload = {
     model: mdl,
@@ -396,6 +417,18 @@ async function callImageApi({ image, prompt, size, model }) {
   }
 
   const res = { name, bytes: bytes.length, jpeg };
+
+  // 透明人像 + alpha 蒙版：同一次生成派生，不额外消耗额度（约 0.9s）
+  if (cutout) {
+    const cut = await makeCutout(full);
+    if (cut) {
+      res.cutout = cut.cutout;
+      res.matte = cut.matte;
+      res.bg = cut.bg;
+      res.subjectRatio = cut.subjectRatio;
+    }
+  }
+
   cacheSet(ck, res);
   return res;
 }
@@ -442,6 +475,16 @@ function jobView(id, req) {
       view.result.jpeg_url = `${base}/files/${j.result.jpeg.name}`;
       view.result.jpeg_bytes = j.result.jpeg.bytes;
     }
+    if (j.result.cutout) {
+      view.result.cutout_url = `${base}/files/${j.result.cutout.name}`;
+      view.result.cutout_bytes = j.result.cutout.bytes;
+    }
+    if (j.result.matte) {
+      view.result.matte_url = `${base}/files/${j.result.matte.name}`;
+      view.result.matte_bytes = j.result.matte.bytes;
+      view.result.matte_bg = j.result.bg || null;
+      view.result.subject_ratio = j.result.subjectRatio ?? null;
+    }
     if (j.result.firstPass) {
       view.result.first_pass_url = `${base}/files/${j.result.firstPass.name}`;
       view.result.refine_prompt = j.refinePrompt || null;
@@ -476,7 +519,7 @@ async function runJob(id) {
   j.status = 'running';
   j.startedAt = Date.now();
   try {
-    let out = await callImageApi({ image: j.image, prompt: j.prompt, size: j.size, model: j.model });
+    let out = await callImageApi({ image: j.image, prompt: j.prompt, size: j.size, model: j.model, cutout: !!j.cutout });
 
     // passes=2：拿第一轮结果当参考图再精修一轮（多消耗 1 次额度）
     if (j.passes === 2 && j.refinePrompt) {
@@ -550,6 +593,12 @@ function submitIdphotoAsync(req, res, params, image, model) {
           bytes: hit.bytes,
           jpeg_url: hit.jpeg ? `${base}/files/${hit.jpeg.name}` : null,
           jpeg_bytes: hit.jpeg?.bytes ?? null,
+          cutout_url: hit.cutout ? `${base}/files/${hit.cutout.name}` : null,
+          cutout_bytes: hit.cutout?.bytes ?? null,
+          matte_url: hit.matte ? `${base}/files/${hit.matte.name}` : null,
+          matte_bytes: hit.matte?.bytes ?? null,
+          matte_bg: hit.bg || null,
+          subject_ratio: hit.subjectRatio ?? null,
         },
       }, corsHeaders(req));
     }
@@ -580,6 +629,7 @@ function submitIdphotoAsync(req, res, params, image, model) {
     refinePrompt: (!params.refineOnly && params.passes === 2) ? buildRefinePrompt(params) : null,
     size: params.size,
     model: mdl,
+      cutout: !!params.cutout,
   };
   jobs.set(id, job);
   setImmediate(() => runJob(id));
@@ -671,6 +721,8 @@ async function handleApi(req, res, url) {
         jpeg_url: out.jpeg ? '/files/' + out.jpeg.name : null,
         bytes: out.bytes,
         jpeg_bytes: out.jpeg?.bytes ?? null,
+        cutout_url: out.cutout ? '/files/' + out.cutout.name : null,
+        matte_url: out.matte ? '/files/' + out.matte.name : null,
         elapsed_ms: Date.now() - t0,
         model: body.model || 'gpt-image-2',
       }, corsHeaders(req));
@@ -699,7 +751,7 @@ async function handleApi(req, res, url) {
     const prompt = params.refineOnly ? buildRefinePrompt(params) : buildPrompt(params);
     const t0 = Date.now();
     try {
-      let out = await callImageApi({ image, prompt, size: params.size, model: body.model });
+      let out = await callImageApi({ image, prompt, size: params.size, model: body.model, cutout: !!params.cutout });
       let firstPass = null;
       let refinePrompt = null;
       if (!params.refineOnly && params.passes === 2) {
@@ -724,6 +776,8 @@ async function handleApi(req, res, url) {
         jpeg_url: out.jpeg ? '/files/' + out.jpeg.name : null,
         bytes: out.bytes,
         jpeg_bytes: out.jpeg?.bytes ?? null,
+        cutout_url: out.cutout ? '/files/' + out.cutout.name : null,
+        matte_url: out.matte ? '/files/' + out.matte.name : null,
         ...(firstPass ? { first_pass_url: '/files/' + firstPass.name } : {}),
         elapsed_ms: Date.now() - t0,
         model: body.model || 'gpt-image-2',
@@ -764,7 +818,7 @@ async function handleApi(req, res, url) {
     for (const k of ['mode', 'suit', 'bg', 'size', 'extra', 'model']) {
       if (qs.has(k)) raw[k] = qs.get(k);
     }
-    for (const k of ['cleanShave', 'tidyHair', 'refineOnly']) {
+    for (const k of ['cleanShave', 'tidyHair', 'refineOnly', 'cutout']) {
       if (qs.has(k)) raw[k] = !/^(0|false|no)$/i.test(String(qs.get(k)));
     }
     if (qs.has('passes')) raw.passes = Number(qs.get('passes'));
