@@ -35,6 +35,7 @@ import { fileURLToPath } from 'node:url';
 import { toJpeg } from './lib/jpeg.mjs';
 import { makeCutout } from './lib/matte.mjs';
 import { makePreview } from './lib/watermark.mjs';
+import { createC2aProxy } from './lib/c2a-proxy.mjs';
 import {
   MODES, SUITS, BGS, SIZES, DEFAULTS,
   normalizeParams, buildPrompt, buildRefinePrompt, describeParams,
@@ -96,6 +97,22 @@ const COMMERCIAL = {
 };
 
 const PAY_STUB = String(process.env.PAY_STUB ?? ((CONFIG.commercial || {}).payStub ? '1' : '0')) === '1';
+/* ------------------------------------------------ c2a 公网网关（/c2a/*） */
+// 暴露 key 与 admin key 分离：调用方拿到的是 c2aKeys，永远看不到 admin key。
+// key 来源：api-keys.json → {"c2aKeys":["sk-c2a-..."]}，或环境变量 C2A_EXPOSE_KEYS（逗号分隔）。
+const C2A_EXPOSE_KEYS = (() => {
+  const fromEnv = String(process.env.C2A_EXPOSE_KEYS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const fromFile = (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'api-keys.json'), 'utf8')).c2aKeys || []; } catch { return []; } })();
+  return [...new Set([...fromEnv, ...fromFile].filter(Boolean))];
+})();
+const C2A_GATEWAY = createC2aProxy({
+  base: C2A_BASE,
+  adminKey: c2aKey(),
+  keys: C2A_EXPOSE_KEYS,
+  maxBody: 24 * 1024 * 1024,
+  perMinute: Number(process.env.C2A_RATE_PER_MINUTE || 12),
+});
+
 const DATA_DIR = path.join(__dirname, 'data');
 const SESS_FILE = path.join(DATA_DIR, 'sessions.json');
 const ORDER_FILE = path.join(DATA_DIR, 'orders.json');
@@ -1302,6 +1319,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // c2a 网关：/c2a/v1/images/edits 等（白名单 + 暴露 key）
+    if (url === '/c2a' || url.startsWith('/c2a/') || url === '/chatgpt2api' || url.startsWith('/chatgpt2api/')) {
+      const handled = await C2A_GATEWAY.handle(req, res, url, { trace, log: (e) => record({ ts: new Date().toISOString(), ...e }) });
+      if (handled) return;
+    }
     if (req.method === 'OPTIONS') {
       res.writeHead(204, corsHeaders(req));
       return res.end();

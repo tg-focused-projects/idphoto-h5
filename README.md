@@ -553,6 +553,58 @@ ext_free_at + price |
 **接入真实支付时要改的地方**：POST /v1/orders/{id}/pay 换成「微信支付下单 + 回调验签」，回调里做 status=paid 与解锁；价格、订单有效期、预览保存期限在 config.commercial 里改。
 
 ---
+### 4.13 把本机 chatgpt2api 受控暴露到公网（/c2a/* 网关）
+
+frps 只放行 remotePort 8000（其它端口一律 port not allowed），所以不开新端口，走同一条 8000 用路径分流。
+
+`
+公网  http://110.40.183.197:8000/c2a/v1/images/edits
+        │
+        ▼
+ idphoto server（8000）里的网关：校验暴露 key → 白名单 → 注入 admin key → 转发
+        │
+        ▼
+ 127.0.0.1:38650  chatgpt2api
+`
+
+**白名单（只有这三个）**
+
+| 方法 | 路径 |
+|---|---|
+| POST | /c2a/v1/images/edits |
+| POST | /c2a/v1/images/generations |
+| GET | /c2a/v1/models |
+
+/c2a/health 返回网关自身状态（不暴露账号/额度明细）；/c2a/api/*（管理面）**一律 403**。
+
+**鉴权**：调用方用**暴露 key**（pi-keys.json → c2aKeys，或 C2A_EXPOSE_KEYS），与 chatgpt2api 的 admin key 分离，admin key 只在服务端注入，外部拿不到。多把 key 支持轮换。
+
+**限流**：每 IP 12 次/分钟（C2A_RATE_PER_MINUTE 可调），请求体上限 24MB。
+
+**调用示例**
+
+`ash
+curl -X POST "http://110.40.183.197:8000/c2a/v1/images/edits" \
+  -H "Authorization: Bearer <C2A_EXPOSE_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-image-2","prompt":"把背景换成纯蓝色","n":1,"response_format":"b64_json","size":"1024x1536",
+       "images":[{"b64_json":"<BASE64>","mime_type":"image/jpeg","filename":"r.jpg"}]}'
+`
+
+返回与 chatgpt2api 原生一致（data[0].b64_json）。实测：46KB 输入 → 30.9s → 1024×1536 PNG（2.0MB）。
+
+**错误码**
+
+| code | 含义 |
+|---|---|
+| missing_key / ad_key | 401 / 403，暴露 key 缺失或无效 |
+| path_not_allowed | 403，路径不在白名单（含所有 /api/*） |
+| ate_limited | 429，超 12 次/分钟 |
+| c2a_unreachable | 502，本机 c2a 没在跑（守护约 60s 内拉起） |
+
+**证件照后端要改成走公网时**：把 C2A_BASE 指向 http://110.40.183.197:8000/c2a，并把 admin key 换成暴露 key 即可；本机部署仍建议直连 127.0.0.1:38650（少一跳、不受限流约束）。
+
+---
 ## 五、验证记录（本机实跑）
 
 ### 5.1 真实自拍（1080×1920，室内杂背景，有胡渣）
