@@ -599,7 +599,8 @@ curl -X POST "http://110.40.183.197:8000/c2a/v1/images/edits" \
 |---|---|
 | missing_key / ad_key | 401 / 403，暴露 key 缺失或无效 |
 | path_not_allowed | 403，路径不在白名单（含所有 /api/*） |
-| ate_limited | 429，超 12 次/分钟 |
+| 
+ate_limited | 429，超 12 次/分钟 |
 | c2a_unreachable | 502，本机 c2a 没在跑（守护约 60s 内拉起） |
 
 **证件照后端要改成走公网时**：把 C2A_BASE 指向 http://110.40.183.197:8000/c2a，并把 admin key 换成暴露 key 即可；本机部署仍建议直连 127.0.0.1:38650（少一跳、不受限流约束）。
@@ -663,6 +664,34 @@ curl -s -H "Authorization: Bearer idphoto-local-2026" http://127.0.0.1:9099/prox
 `
 
 ---
+### 4.15 系统代理怎么设（浏览器/命令行都靠它）
+
+**11-19 事故**：Chrome 打不开 `mp.weixin.qq.com`，报 `ERR_PROXY_CONNECTION_FAILED`。
+原因是 Windows 系统代理还指着 `127.0.0.1:7890`（FlClash），而 FlClash 的核心已经死了、7890 没监听。
+
+现在的设置：
+
+```
+ProxyEnable   = 1
+ProxyServer   = 127.0.0.1:7891     ← 我们自己的 mihomo（watchdog 看护）
+ProxyOverride = localhost;127.*;10.*;172.16.*…;192.168.*;*.local;<local>
+```
+
+mihomo 的规则是「国内直连 + 其余走节点」，所以浏览器两头都能用：
+
+| 目标 | 路径 | 实测 |
+|---|---|---|
+| `mp.weixin.qq.com` | DIRECT | 200，0.14s |
+| `www.baidu.com` | DIRECT | 200，0.08s |
+| `chatgpt.com` | PROXY | 401（未鉴权的正常响应） |
+| `github.com` | PROXY | 200 |
+
+**排查提醒**：`curl` 在 Windows 上用 schannel，会因证书吊销检查失败报
+`CRYPT_E_REVOCATION_OFFLINE`（国内吊销服务器不可达），让人误以为站点挂了。
+命令行验证请加 `--ssl-no-revoke`；Chrome 用自带 CRLSet，不受这个影响。
+
+---
+
 ## 五、验证记录（本机实跑）
 
 ### 5.1 真实自拍（1080×1920，室内杂背景，有胡渣）
