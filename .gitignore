@@ -32,3 +32,6 @@ _ck.txt
 .proxy-watch.lock
 .proxy-watch.heartbeat
 proxy-watch.log
+_px.json
+_*.json
+_temp*
