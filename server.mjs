@@ -558,6 +558,9 @@ async function callImageApi({ image, prompt, size, model, cutout = false }) {
 const jobs = new Map();
 // 同一个 key 正在生成时，重复提交直接返回同一个 job（防止前端重试/双击白烧额度）
 const inflight = new Map();
+// 号池/代理整体不可用时快速失败（c2a 会把 20 个账号逐个试一遍，单次要 70s）
+const BREAKER = { until: 0, code: '', message: '', detail: '' };
+const BREAKER_MS = Number(process.env.BREAKER_MS || 60_000);
 
 function newJobId() {
   return 'job_' + crypto.randomBytes(9).toString('hex');
@@ -690,6 +693,7 @@ async function runJob(id) {
       }
     }
 
+    BREAKER.until = 0;
     j.status = 'succeeded';
     j.result = out;
 
@@ -711,6 +715,12 @@ async function runJob(id) {
     j.status = 'failed';
     j.error = String(e.message || e);
     j.errorCode = e.code || null;
+    if (e.code === 'upstream_quota' || e.code === 'upstream_unreachable') {
+      BREAKER.until = Date.now() + BREAKER_MS;
+      BREAKER.code = e.code;
+      BREAKER.message = String(e.message || '');
+      BREAKER.detail = String(e.detail || '');
+    }
     j.errorDetail = e.detail || null;
     j.errorHint = e.hint || null;
     j.finishedAt = Date.now();
@@ -818,6 +828,17 @@ async function submitIdphotoAsync(req, res, params, image, model) {
       }, corsHeaders(req));
     }
     inflight.delete(ck);
+  }
+
+  // 熔断：最近 60s 内已经确认「号池/代理整体不可用」就直接快速失败，别再让用户等 70s
+  if (BREAKER.until > Date.now()) {
+    return fail(res, req, 503, {
+      error: BREAKER.message,
+      code: BREAKER.code,
+      detail: BREAKER.detail,
+      hint: '生图后端整体不可用（多半是代理出网断了）。已熔断，最多 60s 后自动重试',
+      retry_after_ms: BREAKER.until - Date.now(),
+    });
   }
 
   // ── 商业化：会话额度 + 同会话单飞 ──
