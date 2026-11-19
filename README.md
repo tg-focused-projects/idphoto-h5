@@ -605,6 +605,64 @@ curl -X POST "http://110.40.183.197:8000/c2a/v1/images/edits" \
 **证件照后端要改成走公网时**：把 C2A_BASE 指向 http://110.40.183.197:8000/c2a，并把 admin key 换成暴露 key 即可；本机部署仍建议直连 127.0.0.1:38650（少一跳、不受限流约束）。
 
 ---
+### 4.14 节点守护：出口断了自动换节点
+
+**为什么不用 FlClash 做这件事**：它的 REST 控制器不对外（external-controller 写了但没监听），
+核心 FlClashCore 是服务进程（无提权杀不掉），而且订阅里塞了「剩余流量/套餐到期」这类假节点，
+默认的 url-test 会把票投给它们（实测 自动选择 → 🇦🇱 套餐到期：2027-01-11）→ 所有流量 502。
+
+**做法：跑我们自己的 mihomo，节点名单从 FlClash 的 profile 里抽**
+
+`
+profile(com.follow/clash/profiles/*.yaml)
+   │  tools/make_mihomo_config.py   ← YAML 解析、过滤假节点、只留真实节点
+   ▼
+C:\DSH\tools\mihomo\config.yaml     ← PROXY(select) + AUTO(url-test)，规则只有 MATCH,PROXY
+   │  mihomo.exe -d ... -f ...
+   ▼
+127.0.0.1:7891 (mixed-port)  +  127.0.0.1:9099 (external-controller, secret)
+   │  tools/proxy-watch.mjs  ← 探出口 / 测延迟 / 自动切 PROXY
+   ▼
+chatgpt2api 的 config.json: "proxy": "http://127.0.0.1:7891"
+`
+
+**proxy-watch 的规则**
+
+| 情况 | 动作 |
+|---|---|
+| 通过 7891 CONNECT 打 chatgpt.com/backend-api/models 非 5xx | 视为出口正常 |
+| 出口不通 | 逐个测节点延迟（/proxies/{name}/delay），切到最快的 |
+| 出口正常但当前节点比最快慢 2 倍，且距上次体检 >10 分钟 | 也切 |
+| 所有节点都测不通 | 只记日志，保持现状 |
+
+每轮写 proxy-watch.log 和 .proxy-watch.heartbeat；单实例靠 .proxy-watch.lock。
+
+**watchdog 一起看住**：7891 没监听 → 起 mihomo；.proxy-watch.heartbeat 超过 4 分钟没更新 → 起 proxy-watch。
+
+**实测**
+
+`
+# 自动选最快的节点
+出口 正常（401, 1028ms） 当前=🇺🇸United States 03 体检：2843ms 明显慢于 🇩🇪Germany 01(736ms) → 已切换
+
+# 故障演练：杀掉 mihomo
+已杀 mihomo pid=75704
+✔ 7891 恢复，用时 22s（watchdog: started mihomo:7891）
+chatgpt -> 401（出口恢复）
+
+# 端到端
+POST /v1/idphoto → succeeded，61.8s，走 7891 → 🇩🇪Germany 01
+`
+
+**日常运维**
+
+`ash
+python tools/make_mihomo_config.py          # 订阅更新后重新生成节点表
+node tools/proxy-watch.mjs --once           # 手动跑一轮（探出口 + 体检）
+curl -s -H "Authorization: Bearer idphoto-local-2026" http://127.0.0.1:9099/proxies | head -c 400
+`
+
+---
 ## 五、验证记录（本机实跑）
 
 ### 5.1 真实自拍（1080×1920，室内杂背景，有胡渣）

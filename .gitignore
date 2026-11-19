@@ -29,3 +29,6 @@ data/
 _*.log
 _*.err
 _ck.txt
+.proxy-watch.lock
+.proxy-watch.heartbeat
+proxy-watch.log

@@ -181,6 +181,30 @@ async function tick() {
     c2aMisses = 0;
   }
 
+  // 3.7) 自建代理内核（mihomo 7891）+ 节点守护（proxy-watch）
+  if (!(await tcpOpen(7891))) {
+    if (cooldownOk()) {
+      const exe = 'C:\\DSH\\tools\\mihomo\\mihomo.exe';
+      if (fs.existsSync(exe)) {
+        spawnDetached(exe, ['-d', 'C:\\DSH\\tools\\mihomo', '-f', 'C:\\DSH\\tools\\mihomo\\config.yaml']);
+        for (let i = 0; i < 20 && !(await tcpOpen(7891)); i++) await sleep(500);
+        acts.push((await tcpOpen(7891)) ? 'started mihomo:7891' : 'FAILED start mihomo');
+      } else {
+        acts.push('mihomo.exe 不存在（C:\\DSH\\tools\\mihomo）');
+      }
+      lastRestart = Date.now();
+    }
+  }
+  {
+    const hb = path.join(ROOT, '.proxy-watch.heartbeat');
+    let stale = true;
+    try { stale = Date.now() - fs.statSync(hb).mtimeMs > 240_000; } catch { stale = true; }
+    if (stale && (await tcpOpen(7891))) {
+      spawnDetached(process.execPath, [path.join(ROOT, 'tools', 'proxy-watch.mjs')], { cwd: ROOT });
+      acts.push('started proxy-watch');
+    }
+  }
+
   // 4) 公网体检
   const c2 = await httpCode(`http://127.0.0.1:${LOCAL_PORT}/api/health`);
   if (c2 === 200 || c2 === 401) {
